@@ -140,7 +140,8 @@ var CONFIG = {
     // ---------------- 網格（蛇形）掃描 ----------------
     // 第 0 列：往右掃 cols 格 → 往下 1 格 → 第 1 列：往左掃回來 → 往下 …
     grid: {
-        // 想直接用「公里」指定範圍就填這裡，例如 { east: 10, south: 10 }（往東 10km、往南 10km），
+        // 想直接用「公里」指定範圍就填這裡：10（= 往東 10km、往南 10km），
+        // 或 { east: 20, south: 5 }（東西 20km、南北 5km），
         // 會自動算出 cols/rows；設成 null 則使用下面的 cols/rows
         sizeKm: null,
         // 地圖比例尺：1 px ≈ 幾公尺（依兩顆菇座標實測：712 px ≈ 386 m）
@@ -257,6 +258,8 @@ var CONFIG = {
         // console 視窗位置 [x,y,w,h]：放在左上角，不擋地圖比對範圍和底部按鈕
         // （截圖會拍到 console，點擊也會被它擋住，所以要放在 match.region 以外）
         consoleRect: [0, 60, 860, 280],
+        // 懸浮「停止」按鈕位置 [x,y,w,h]（放右上角狀態列附近，不擋地圖比對範圍）；不要就設 null
+        stopButton: [870, 40, 190, 110],
         saveDetailShots: false,     // 額外保存詳情頁截圖
         saveMapsShots: false        // 額外保存 Google Maps 截圖
     }
@@ -1364,6 +1367,7 @@ function setup() {
     }
 
     auto.waitFor();   // 等無障礙服務
+    showStopButton();
     // 長時間掃描：保持螢幕常亮（腳本結束後自動恢復）
     try { device.keepScreenOn(24 * 3600 * 1000); } catch (e) { warn("無法保持螢幕常亮：" + e); }
     [CONFIG.paths.baseDir, CONFIG.paths.shotsDir].forEach(function (d) { files.ensureDir(d); });
@@ -1388,6 +1392,28 @@ function setup() {
 
     loadTemplates();
     loadExistingRecords();
+}
+
+/** 右上角懸浮「停止」按鈕：按下後在安全點停止並保存進度 */
+var STOP_BTN = null;
+function showStopButton() {
+    var b = CONFIG.debug.stopButton;
+    if (!b) return;
+    try {
+        STOP_BTN = floaty.rawWindow(
+            '<frame><button id="stop" text="停止" textSize="14sp" bg="#cc3333" textColor="#ffffff" w="*" h="*"/></frame>');
+        var dm = context.getResources().getDisplayMetrics();
+        var fx = dm.widthPixels / CONFIG.screen.designWidth, fy = dm.heightPixels / CONFIG.screen.designHeight;
+        STOP_BTN.setSize(Math.round(b[2] * fx), Math.round(b[3] * fy));
+        STOP_BTN.setPosition(Math.round(b[0] * fx), Math.round(b[1] * fy));
+        STOP_BTN.stop.click(function () {
+            STOP.set(true);
+            toast("收到停止，處理完目前步驟就停（進度會保存）");
+            ui.run(function () { STOP_BTN.stop.setText("停止中…"); });
+        });
+    } catch (e) {
+        warn("無法顯示停止按鈕：" + e + "（請用 Autox.js 管理頁停止）");
+    }
 }
 
 /**
@@ -1425,11 +1451,15 @@ function mainLoop() {
     setup();
 
     var g = CONFIG.grid;
-    if (g.sizeKm) {
-        g.cols = Math.max(1, Math.ceil(g.sizeKm.east * 1000 / (CONFIG.swipe.distanceX * g.metersPerPixelX)) + 1);
-        g.rows = Math.max(1, Math.ceil(g.sizeKm.south * 1000 / (CONFIG.swipe.distanceY * g.metersPerPixelY)) + 1);
-        info("範圍 " + g.sizeKm.east + "km(東) x " + g.sizeKm.south + "km(南) → " + g.cols + " x " + g.rows + " 格");
+    var sk = g.sizeKm;
+    if (typeof sk === "number") sk = { east: sk, south: sk };   // sizeKm: 10 → 10x10 km
+    if (sk) {
+        if (!(sk.east > 0 && sk.south > 0)) throw new Error("grid.sizeKm 格式錯誤，請填數字（如 10）或 { east: 10, south: 10 }");
+        g.cols = Math.max(1, Math.ceil(sk.east * 1000 / (CONFIG.swipe.distanceX * g.metersPerPixelX)) + 1);
+        g.rows = Math.max(1, Math.ceil(sk.south * 1000 / (CONFIG.swipe.distanceY * g.metersPerPixelY)) + 1);
+        info("範圍 " + sk.east + "km(東) x " + sk.south + "km(南) → " + g.cols + " x " + g.rows + " 格");
     }
+    if (!(g.cols > 0 && g.rows > 0)) throw new Error("請設定 grid.sizeKm，或 grid.cols / grid.rows（正整數）");
     var total = g.cols * g.rows;
     var plan = decideStart(total);
     var start = plan.start;
@@ -1502,6 +1532,7 @@ var worker = threads.start(function () {
         TEMPLATES.forEach(function (t) { try { t.img.recycle(); } catch (e) { } });
         if (ANCHOR_IMG) { try { ANCHOR_IMG.recycle(); } catch (e) { } }
         try { device.cancelKeepingAwake(); } catch (e) { }
+        try { if (STOP_BTN) STOP_BTN.close(); } catch (e) { }
     }
 });
 
