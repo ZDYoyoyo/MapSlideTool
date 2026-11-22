@@ -120,6 +120,13 @@ var CONFIG = {
     // ---------------- 網格（蛇形）掃描 ----------------
     // 第 0 列：往右掃 cols 格 → 往下 1 格 → 第 1 列：往左掃回來 → 往下 …
     grid: {
+        // 想直接用「公里」指定範圍就填這裡，例如 { east: 10, south: 10 }（往東 10km、往南 10km），
+        // 會自動算出 cols/rows；設成 null 則使用下面的 cols/rows
+        sizeKm: null,
+        // 地圖比例尺：1 px ≈ 幾公尺（依兩顆菇座標實測：712 px ≈ 386 m）
+        // 地圖有透視傾斜，垂直方向尚未實測，暫用相同數值
+        metersPerPixelX: 0.542,
+        metersPerPixelY: 0.542,
         cols: 5,
         rows: 5,
         resume: true,               // 有 progress.json 時，啟動會跳視窗問你要不要接續
@@ -1254,7 +1261,13 @@ function decideStart(total) {
 function mainLoop() {
     setup();
 
-    var total = CONFIG.grid.cols * CONFIG.grid.rows;
+    var g = CONFIG.grid;
+    if (g.sizeKm) {
+        g.cols = Math.max(1, Math.ceil(g.sizeKm.east * 1000 / (CONFIG.swipe.distanceX * g.metersPerPixelX)) + 1);
+        g.rows = Math.max(1, Math.ceil(g.sizeKm.south * 1000 / (CONFIG.swipe.distanceY * g.metersPerPixelY)) + 1);
+        info("範圍 " + g.sizeKm.east + "km(東) x " + g.sizeKm.south + "km(南) → " + g.cols + " x " + g.rows + " 格");
+    }
+    var total = g.cols * g.rows;
     var plan = decideStart(total);
     var start = plan.start;
 
