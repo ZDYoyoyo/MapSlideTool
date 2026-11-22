@@ -10,26 +10,24 @@
  *   4. （選用）想用音量下鍵停止腳本：AutoX 設定裡開啟「音量鍵停止」或
  *      「按鍵監聽」相關權限
  *
- * 【放樣板圖】
- *   1. 在遊戲地圖上手動截一張含目標怪的全螢幕圖（用手機截圖即可）
- *   2. 用修圖 App 只裁出「怪物本體」一小塊（建議 60~150 px 見方，
- *      盡量不要包含地圖背景），存成 PNG
- *   3. 放到手機 /sdcard/MapScan/templates/target.png
- *      （可放多張：不同姿勢/外觀，填進 CONFIG.match.templates 陣列）
- *   4. （強烈建議）再裁一張「只有在地圖主畫面才會出現的 UI 元件」
- *      （例如地圖右下角的指南針按鈕）存成 map_anchor.png，
- *      腳本會用它確認是否已回到地圖畫面
- *   ※ 樣板圖必須在「同一支手機、同一解析度」下截取，否則比對會失敗。
+ * 【放樣板圖】（目標換了只要換這個資料夾裡的圖，不用改程式）
+ *   1. 在遊戲地圖上截一張含目標的全螢幕圖（用手機截圖即可）
+ *   2. 用相簿的「裁切」只框出目標本體一小塊（約 80~150 px 見方），
+ *      不要框到上面會變動的數字/計時圈，也盡量少框地圖背景
+ *   3. 放進 /sdcard/MapScan/templates/targets/（png 或 jpg 都可）
+ *      資料夾裡「所有圖片」都會被當成目標，任一張比對到就算：
+ *        - 換目標：刪掉舊圖、放新圖
+ *        - 同時找多種目標：放多張
+ *   4. map_anchor.png 放在 /sdcard/MapScan/templates/（地圖模式底部
+ *      中間那顆「地圖」切換按鈕），用來確認已回到地圖畫面
+ *   ※ 樣板圖必須在「同一支手機、同一解析度、差不多的地圖縮放」下截取。
  *
- * 【一定要先改的參數】（都在下方 CONFIG 區塊，標有「★這裡要換」）
- *   - CONFIG.gamePackage           遊戲套件名（可用 AutoX「布局分析」或
- *                                  在腳本中 log(currentPackage()) 取得）
- *   - CONFIG.screen.designWidth/Height  你量測座標時的螢幕解析度
- *   - CONFIG.taps.*                「開啟 Google Map」按鈕、複製連結、返回等座標
- *   - CONFIG.swipe.*               滑動中心點與距離
- *   - CONFIG.match.region          地圖可比對範圍（排除上下 UI 列）
- *   - CONFIG.ocr.*Region           OCR 要辨識的區域
+ * 【參數】（CONFIG 區塊）
+ *   已依 Pikmin Bloom + 1080x2460 螢幕的截圖量好，通常只需要調：
  *   - CONFIG.grid.cols / rows      要掃幾格
+ *   - CONFIG.match.threshold       漏抓→調低、誤判→調高
+ *   - CONFIG.swipe.waitAfter       物件刷出慢就調長
+ *   換手機或遊戲改版時，再重量 taps / region 相關座標。
  *
  * 【輸出】
  *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path
@@ -48,14 +46,14 @@
 // 所有「座標」都以 designWidth x designHeight 這個解析度為準，
 // 腳本會自動依實際螢幕比例換算。你用哪支手機截圖量測，就填那支的解析度。
 var CONFIG = {
-    // ★這裡要換成遊戲實際的套件名
+    // 遊戲套件名（Pikmin Bloom）
     gamePackage: "com.nianticlabs.pikmin",
     // Google Maps 的套件名（一般不用改）
     googleMapsPackages: ["com.google.android.apps.maps"],
 
     screen: {
-        designWidth: 1080,   // ★這裡要換成你量測座標時的螢幕寬（px）
-        designHeight: 2460,  // ★這裡要換成你量測座標時的螢幕高（px）
+        designWidth: 1080,   // 量測座標時的螢幕寬（px）
+        designHeight: 2460,  // 量測座標時的螢幕高（px）
         landscape: false     // 遊戲若是橫向，改 true
     },
 
@@ -68,18 +66,20 @@ var CONFIG = {
         progressFile: "/sdcard/MapScan/progress.json"
     },
 
-    // ---------------- 目標怪樣板比對 ----------------
+    // ---------------- 目標樣板比對 ----------------
     match: {
-        // 可放多張樣板（同一隻怪不同外觀），任一張比對到就算
-        templates: [
-            "/sdcard/MapScan/templates/target.png"
-        ],
-        threshold: 0.80,            // matchTemplate 相似度門檻（0~1）。誤判多就調高，漏抓多就調低
-        // 比對範圍 [x, y, w, h]（design 座標）。★這裡要換：排除上方狀態列/下方按鈕列
-        region: [0, 250, 1080, 1850],
+        // 這個資料夾裡所有 png/jpg 都會載入當樣板（換目標只要換圖）
+        templateDir: "/sdcard/MapScan/templates/targets/",
+        // 也可以另外指定個別檔案（可留空陣列）
+        templates: [],
+        // matchTemplate 相似度門檻（0~1）。漏抓就調低（0.7），誤判就調高（0.85）
+        threshold: 0.75,
+        // 比對範圍 [x, y, w, h]：排除狀態列(上 ~130px)與底部按鈕列(下 ~2200px 起)
+        // 依你 1080x2460 的截圖量測，畫面改版再調
+        region: [0, 140, 1080, 2060],
         maxPerCapture: 5,           // 單張截圖最多取幾個符合點
-        clickOffset: { x: 0, y: 0 },// 點擊位置相對於樣板中心的偏移（design px）
-        sameTargetRadius: 80,       // 同一格內，距離小於此值（design px）視為同一隻，不重點
+        clickOffset: { x: 0, y: 30 },// 點擊位置相對於樣板中心的偏移（樣板是蘑菇傘，往下點一點較穩）
+        sameTargetRadius: 120,      // 同一格內，距離小於此值（px）視為同一隻，不重點
         maxTargetsPerCell: 3        // 每格最多處理幾隻
     },
 
@@ -87,7 +87,7 @@ var CONFIG = {
     mapAnchor: {
         template: "/sdcard/MapScan/templates/map_anchor.png", // 不用就設成 ""
         threshold: 0.80,
-        region: null,               // [x,y,w,h] design 座標；null = 全螢幕
+        region: [380, 2180, 320, 240], // 只在底部中間找，比較快也不易誤判
         maxBackPresses: 4           // 找不到 anchor 時最多按幾次返回
     },
 
@@ -105,35 +105,38 @@ var CONFIG = {
 
     // ---------------- 滑動參數 ----------------
     swipe: {
-        centerX: 540,               // ★這裡要換：滑動中心點（地圖中央、避開按鈕）
-        centerY: 1250,              // ★這裡要換
-        distanceX: 700,             // 每次水平滑動距離（建議 < 螢幕寬，保留重疊避免漏抓）
-        distanceY: 1100,            // 每次垂直滑動距離（建議 < 地圖可視高度）
+        centerX: 540,               // 滑動中心點（地圖中央，避開右上頭像與底部按鈕）
+        centerY: 1200,
+        distanceX: 800,             // 每次水平滑動距離（螢幕寬 1080，約留 25% 重疊）
+        distanceY: 1500,            // 每次垂直滑動距離（可視高度約 2060，約留 25% 重疊）
         duration: 700,              // 滑動耗時 ms（越慢越不會甩出慣性）
         holdAtEnd: true,            // 結尾停住手指，抑制地圖慣性滑動
-        waitAfter: 2500             // 滑動後等怪物刷出的時間 ms
+        waitAfter: 3000             // 滑動後等地圖物件刷出的時間 ms
     },
 
     // ---------------- 各種點擊位置 ----------------
+    // 座標依你 1080x2460 的截圖量測
     taps: {
-        // 詳情頁「開啟 Google Map」按鈕：先用文字找（無障礙節點），找不到才用座標
-        openMapButton: {
-            texts: ["開啟 Google Map", "開啟Google Map", "Google Map", "Google 地圖"],
-            x: 540, y: 1950         // ★這裡要換成你手機實際的座標
-        },
-        // 詳情頁若有「複製連結/分享」按鈕，enabled 設 true 並填座標（方法 A 最準）
+        // 從詳情頁開啟 Google Maps 要依序點的按鈕（Pikmin Bloom：前往這裡 → 在地圖應用程式開啟）
+        // 遊戲是 Unity 製作，按鈕多半讀不到文字，所以主要靠座標；texts 只是先試一下
+        openMapSteps: [
+            { name: "前往這裡",           texts: ["前往這裡"],           x: 870, y: 2308, wait: 1500 },
+            { name: "在地圖應用程式開啟", texts: ["在地圖應用程式開啟"], x: 540, y: 2118, wait: 800 }
+        ],
+        textSearchTimeout: 600,     // 每個按鈕用文字找的時間 ms（Unity 畫面找不到，設短一點）
+        // 詳情頁若有「複製連結/分享」按鈕，enabled 設 true 並填座標（Pikmin Bloom 沒有，保持 false）
         copyLinkButton: {
             enabled: false,
             texts: ["複製連結", "複製座標", "複製", "Copy link"],
-            x: 960, y: 320          // ★這裡要換成你手機實際的座標
+            x: 960, y: 320
         },
-        // 返回：useSystemBack=true 用系統返回鍵；false 則點下面座標（遊戲內返回鈕）
+        // 返回：useSystemBack=true 用系統返回鍵；false 則點遊戲左下角的「<」
         backButton: {
             useSystemBack: true,
-            x: 80, y: 160           // ★這裡要換成你手機實際的座標
+            x: 105, y: 2310
         },
         detailCloseBackPresses: 1,  // 回到遊戲後，要按幾次返回才能關閉詳情頁（沒有 anchor 時使用）
-        // 點「開啟 Google Map」後若跳出「選擇開啟方式」對話框
+        // 若跳出「選擇開啟方式」對話框（有設預設 App 就不會出現）
         chooser: {
             appTexts: ["Google 地圖", "地圖", "Maps", "Google Maps"],
             onceTexts: ["只限一次", "僅此一次", "Just once"]
@@ -155,9 +158,9 @@ var CONFIG = {
         enabled: true,
         engine: "auto",             // "auto" | "gmlkit" | "paddle" | "custom"
         language: "zh",             // gmlkit 語言：zh / la(拉丁) / ja / ko ...
-        // 要辨識的區域 [x,y,w,h]（design 座標）。★這裡要換
-        detailRegion: [0, 400, 1080, 900],  // 遊戲詳情頁上座標/地名所在區域
-        mapsRegion: [0, 150, 1080, 350],    // Google Maps 上方搜尋列/底部資訊卡區域
+        // 要辨識的區域 [x,y,w,h]
+        detailRegion: [300, 120, 480, 150], // 詳情頁頂端地名（如「王公廟」），只能記到 unresolved 當參考
+        mapsRegion: [0, 110, 1080, 160],    // Google Maps 頂端搜尋列（顯示 "22.506671,120.386556"）
         // engine="custom" 時呼叫此函式：function(img) { return "辨識文字"; }
         // 例如接 Tesseract 外掛時在這裡實作
         customOcr: null
@@ -165,11 +168,11 @@ var CONFIG = {
 
     // ---------------- 等待時間（ms） ----------------
     timing: {
-        afterTapMonster: 2500,      // 點怪後等詳情頁
-        afterOpenMap: 4000,         // 點「開啟 Google Map」後等 Maps 載入
+        afterTapMonster: 3000,      // 點怪後等詳情頁（含進場動畫）
+        afterOpenMap: 3500,         // Google Maps 出現後再等它載入完
         waitMapsTimeout: 12000,     // 等 Google Maps 進前景的最長時間
         afterBack: 1500,
-        afterLaunchGame: 4000,
+        afterLaunchGame: 3500,
         betweenActions: 700,
         clipboardWait: 900
     },
@@ -547,8 +550,20 @@ function ocrRegion(img, designRegion) {
 // ============================================================================
 // =                     樣板比對 / 地圖畫面確認                               =
 // ============================================================================
+function listTemplateFiles() {
+    var list = (CONFIG.match.templates || []).slice();
+    var dir = CONFIG.match.templateDir;
+    if (dir) {
+        files.ensureDir(dir + "x");
+        files.listDir(dir, function (name) { return /\.(png|jpe?g)$/i.test(name); })
+            .forEach(function (name) { list.push(files.join(dir, name)); });
+    }
+    if (!list.length) throw new Error("沒有任何目標樣板圖，請放到 " + dir);
+    return list;
+}
+
 function loadTemplates() {
-    CONFIG.match.templates.forEach(function (p) {
+    listTemplateFiles().forEach(function (p) {
         if (!files.exists(p)) throw new Error("樣板圖不存在：" + p);
         var img = images.read(p);
         if (!img) throw new Error("樣板圖讀取失敗：" + p);
@@ -807,11 +822,12 @@ function handleTarget(hit, cellShotPath, label) {
             if (coords) info("方法 A2（詳情頁節點文字）成功");
         }
 
-        // ---- 4. 點「開啟 Google Map」 ----
+        // ---- 4. 依序點按鈕開啟 Google Maps（前往這裡 → 在地圖應用程式開啟） ----
         if (!coords) {
-            var om = CONFIG.taps.openMapButton;
-            if (!tapByTexts(om.texts, 1500)) tap(om.x, om.y, "開啟 Google Map");
-            nap(CONFIG.timing.betweenActions);
+            CONFIG.taps.openMapSteps.forEach(function (st) {
+                if (!tapByTexts(st.texts, CONFIG.taps.textSearchTimeout)) tap(st.x, st.y, st.name);
+                nap(st.wait || CONFIG.timing.betweenActions);
+            });
 
             // 若跳出「開啟方式」選擇器
             if (currentPackage() !== CONFIG.gamePackage &&
