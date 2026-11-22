@@ -457,7 +457,7 @@ function readClipboard() {
 
     var w = null;
     try {
-        w = floaty.rawWindow(<frame />);
+        w = floaty.rawWindow("<frame/>");   // 用字串，Autox.js v7 不支援 XML 字面語法
         w.setSize(1, 1);
         w.setTouchable(false);
         ui.run(function () { w.requestFocus(); });
