@@ -32,8 +32,9 @@
  *   換手機或遊戲改版時，再重量 taps / region 相關座標。
  *
  * 【輸出】
- *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path,players
- *                                    （players = 地圖上人頭圖案旁的參加人數，讀不到則留空）
+ *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path,players,updated_at
+ *                                    每顆目標一行；players = 人頭圖案旁的參加人數（讀不到留空），
+ *                                    再次掃到同一顆會更新 players 與 updated_at（最後看到的時間）
  *   /sdcard/MapScan/unresolved.csv   找到怪但拿不到經緯度的（含 OCR 原文）
  *   /sdcard/MapScan/errors.log       錯誤紀錄
  *   /sdcard/MapScan/progress.json    續跑進度
@@ -211,7 +212,8 @@ var CONFIG = {
     },
 
     // ---------------- 去重 ----------------
-    // 在 windowMinutes 分鐘內、距離小於 distanceMeters 公尺的座標視為重複
+    // 「上次看到」在 windowMinutes 分鐘內、距離小於 distanceMeters 公尺 → 視為同一顆，更新人數
+    // 超過時間窗才出現 → 當成新的一顆（新的一行）
     // windowMinutes = 0 表示不限時間（同一點永遠只記一次）
     dedupe: {
         distanceMeters: 15,
@@ -236,7 +238,7 @@ var REAL_W = 0, REAL_H = 0;       // 實際截圖解析度
 var TEMPLATES = [];               // [{path, img}]
 var ANCHOR_IMG = null;
 var POPUP_IMG = null;
-var RECORDS = [];                 // 已記錄座標 [{t(ms), lat, lng}]，用於去重
+var RECORDS = [];                 // found.csv 全部紀錄 [{t(上次看到 ms), lat, lng, row[欄位]}]
 
 // ============================================================================
 // =                              小工具                                       =
@@ -760,7 +762,44 @@ function haversine(a, b) {
     return 2 * R * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
 }
 
-var CSV_HEADER = "timestamp,lat,lng,screenshot_path,players";
+// found.csv：每顆目標只有一行；再次掃到同一顆時更新 players 與 updated_at
+var CSV_HEADER = "timestamp,lat,lng,screenshot_path,players,updated_at";
+
+function csvEscape(s) {
+    s = String(s == null ? "" : s);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+/** 解析一行 CSV（支援雙引號欄位） */
+function csvSplit(line) {
+    var out = [], cur = "", q = false;
+    for (var i = 0; i < line.length; i++) {
+        var ch = line.charAt(i);
+        if (q) {
+            if (ch === '"' && line.charAt(i + 1) === '"') { cur += '"'; i++; }
+            else if (ch === '"') q = false;
+            else cur += ch;
+        } else if (ch === '"') q = true;
+        else if (ch === ",") { out.push(cur); cur = ""; }
+        else cur += ch;
+    }
+    out.push(cur);
+    return out;
+}
+
+/** 把記憶體中的所有紀錄整份寫回 found.csv（先寫暫存檔再取代，避免中途被中斷而損毀） */
+function rewriteCsv() {
+    var p = CONFIG.paths.logCsv, tmp = p + ".tmp";
+    var body = [CSV_HEADER].concat(RECORDS.map(function (r) {
+        return r.row.map(csvEscape).join(",");
+    })).join("\n") + "\n";
+    files.write(tmp, body);
+    var dst = new java.io.File(p);
+    if (!new java.io.File(tmp).renameTo(dst)) {   // 少數機型 rename 不能覆蓋，改為直接寫
+        files.write(p, body);
+        files.remove(tmp);
+    }
+}
 
 function loadExistingRecords() {
     var p = CONFIG.paths.logCsv;
@@ -770,49 +809,62 @@ function loadExistingRecords() {
     }
     var content = String(files.read(p));
     var lines = content.split(/\r?\n/);
-    if (lines[0].trim() !== CSV_HEADER) {
-        // 舊格式（沒有 players 欄）：備份舊檔，開新檔；舊資料仍用於去重
+    var oldFormat = lines[0].trim() !== CSV_HEADER;
+    for (var i = 1; i < lines.length; i++) {
+        if (!lines[i].trim()) continue;
+        var f = csvSplit(lines[i]);
+        if (f.length < 3) continue;
+        var lat = parseFloat(f[1]), lng = parseFloat(f[2]);
+        if (!validLatLng(lat, lng)) continue;
+        // 舊格式自動轉換：補上 players / updated_at 欄位
+        var row = [f[0], f[1], f[2], f[3] || "", f[4] || "", f[5] || f[0]];
+        var t = parseTime(row[5]);
+        RECORDS.push({ t: isNaN(t) ? 0 : t, lat: lat, lng: lng, row: row });
+    }
+    if (oldFormat) {
         var bak = p.replace(/\.csv$/, "") + "_old_" + fmtFileTime() + ".csv";
         files.write(bak, content);
-        files.write(p, CSV_HEADER + "\n");
-        info("found.csv 是舊格式，已備份為 " + bak + " 並建立新檔");
+        rewriteCsv();
+        info("found.csv 已轉成新格式（舊檔備份為 " + bak + "）");
     }
-    for (var i = 1; i < lines.length; i++) {
-        var f = lines[i].split(",");
-        if (f.length < 3) continue;
-        var t = parseTime(f[0]), lat = parseFloat(f[1]), lng = parseFloat(f[2]);
-        if (validLatLng(lat, lng)) RECORDS.push({ t: isNaN(t) ? 0 : t, lat: lat, lng: lng });
-    }
-    info("已載入既有紀錄 " + RECORDS.length + " 筆（用於去重）");
+    info("已載入既有紀錄 " + RECORDS.length + " 筆");
 }
 
-function isDuplicate(c, nowMs) {
+/** 找出同一顆目標的既有紀錄（距離夠近，且上次看到的時間在 windowMinutes 內） */
+function findDuplicate(c, nowMs) {
     var win = CONFIG.dedupe.windowMinutes * 60000;
+    var best = null, bestD = 1e9;
     for (var i = 0; i < RECORDS.length; i++) {
         var r = RECORDS[i];
         if (win > 0 && Math.abs(nowMs - r.t) > win) continue;
-        if (haversine(r, c) <= CONFIG.dedupe.distanceMeters) return true;
+        var d = haversine(r, c);
+        if (d <= CONFIG.dedupe.distanceMeters && d < bestD) { best = r; bestD = d; }
     }
-    return false;
+    return best;
 }
 
-function csvEscape(s) {
-    s = String(s == null ? "" : s);
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
-
-/** 寫入 found.csv；重複則略過。回傳 true=已寫入 */
+/**
+ * 寫入 found.csv。
+ * 新目標 → 新增一行；已記錄過的同一顆 → 更新該行的人數與 updated_at。
+ */
 function recordCoords(c, shotPath, players) {
-    var now = new Date();
-    if (isDuplicate(c, now.getTime())) {
-        info("座標 " + c.lat + "," + c.lng + " 與近期紀錄重複，略過");
+    var now = new Date(), nowStr = fmtTime(now);
+    var pl = (players === null || players === undefined) ? "" : String(players);
+    var dup = findDuplicate(c, now.getTime());
+    if (dup) {
+        dup.t = now.getTime();               // 以「最後看到的時間」計算去重時間窗
+        var old = dup.row[4];
+        if (pl !== "") dup.row[4] = pl;      // 這次讀不到人數就保留舊值
+        dup.row[5] = nowStr;
+        rewriteCsv();
+        info("已記錄過 " + dup.row[1] + "," + dup.row[2] + "，更新人數 " +
+            (old === "" ? "?" : old) + " → " + (dup.row[4] === "" ? "?" : dup.row[4]));
         return false;
     }
-    var line = [fmtTime(now), c.lat.toFixed(6), c.lng.toFixed(6), csvEscape(shotPath),
-        (players === null || players === undefined) ? "" : players].join(",");
-    files.append(CONFIG.paths.logCsv, line + "\n");
-    RECORDS.push({ t: now.getTime(), lat: c.lat, lng: c.lng });
-    info("★ 已記錄：" + line);
+    var row = [nowStr, c.lat.toFixed(6), c.lng.toFixed(6), shotPath || "", pl, nowStr];
+    files.append(CONFIG.paths.logCsv, row.map(csvEscape).join(",") + "\n");
+    RECORDS.push({ t: now.getTime(), lat: c.lat, lng: c.lng, row: row });
+    info("★ 已記錄：" + row.join(","));
     return true;
 }
 
