@@ -49,13 +49,13 @@
 // 腳本會自動依實際螢幕比例換算。你用哪支手機截圖量測，就填那支的解析度。
 var CONFIG = {
     // ★這裡要換成遊戲實際的套件名
-    gamePackage: "com.example.game",
+    gamePackage: "com.nianticlabs.pikmin",
     // Google Maps 的套件名（一般不用改）
     googleMapsPackages: ["com.google.android.apps.maps"],
 
     screen: {
         designWidth: 1080,   // ★這裡要換成你量測座標時的螢幕寬（px）
-        designHeight: 2400,  // ★這裡要換成你量測座標時的螢幕高（px）
+        designHeight: 2460,  // ★這裡要換成你量測座標時的螢幕高（px）
         landscape: false     // 遊戲若是橫向，改 true
     },
 
