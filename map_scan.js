@@ -20,6 +20,8 @@
  *        - 同時找多種目標：放多張
  *   4. map_anchor.png 放在 /sdcard/MapScan/templates/（地圖模式底部
  *      中間那顆「地圖」切換按鈕），用來確認已回到地圖畫面
+ *   5. popup_arrow.png 放在 /sdcard/MapScan/templates/（點蘑菇後出現的
+ *      黑色名稱泡泡右邊的「>」），用來找泡泡並點進詳情頁
  *   ※ 樣板圖必須在「同一支手機、同一解析度、差不多的地圖縮放」下截取。
  *
  * 【參數】（CONFIG 區塊）
@@ -81,6 +83,18 @@ var CONFIG = {
         clickOffset: { x: 0, y: 30 },// 點擊位置相對於樣板中心的偏移（樣板是蘑菇傘，往下點一點較穩）
         sameTargetRadius: 120,      // 同一格內，距離小於此值（px）視為同一隻，不重點
         maxTargetsPerCell: 3        // 每格最多處理幾隻
+    },
+
+    // ---------------- 點目標後的名稱泡泡 ----------------
+    // Pikmin Bloom：點蘑菇後上方會出現「巨大 輝煌蘑菇 / 地名 >」的黑色泡泡，要再點泡泡才進詳情頁
+    popup: {
+        enabled: true,
+        template: "/sdcard/MapScan/templates/popup_arrow.png", // 泡泡右側的「>」
+        threshold: 0.85,
+        // 找不到泡泡時的備援：點「目標中心 + 這個偏移」（泡泡約在蘑菇傘上方 165px）
+        fallbackOffset: { x: 0, y: -165 },
+        waitAfterTapTarget: 1500,   // 點蘑菇後等泡泡出現（地圖會稍微移動）
+        retries: 2                  // 點完泡泡仍停在地圖上時，重試幾次
     },
 
     // ---------------- 地圖畫面確認（選用但強烈建議） ----------------
@@ -168,7 +182,7 @@ var CONFIG = {
 
     // ---------------- 等待時間（ms） ----------------
     timing: {
-        afterTapMonster: 3000,      // 點怪後等詳情頁（含進場動畫）
+        afterTapMonster: 3000,      // 點泡泡後等詳情頁（含進場動畫）
         afterOpenMap: 3500,         // Google Maps 出現後再等它載入完
         waitMapsTimeout: 12000,     // 等 Google Maps 進前景的最長時間
         afterBack: 1500,
@@ -205,6 +219,7 @@ var STOP = new java.util.concurrent.atomic.AtomicBoolean(false);
 var REAL_W = 0, REAL_H = 0;       // 實際截圖解析度
 var TEMPLATES = [];               // [{path, img}]
 var ANCHOR_IMG = null;
+var POPUP_IMG = null;
 var RECORDS = [];                 // 已記錄座標 [{t(ms), lat, lng}]，用於去重
 
 // ============================================================================
@@ -570,6 +585,14 @@ function loadTemplates() {
         TEMPLATES.push({ path: p, img: img });
         info("載入樣板 " + p + "（" + img.getWidth() + "x" + img.getHeight() + "）");
     });
+    if (CONFIG.popup.enabled && CONFIG.popup.template) {
+        if (files.exists(CONFIG.popup.template)) {
+            POPUP_IMG = images.read(CONFIG.popup.template);
+            info("載入泡泡樣板 " + CONFIG.popup.template);
+        } else {
+            warn("找不到泡泡樣板 " + CONFIG.popup.template + "，將改用固定偏移點擊");
+        }
+    }
     var ap = CONFIG.mapAnchor.template;
     if (ap) {
         if (files.exists(ap)) {
@@ -782,6 +805,59 @@ function saveProgress(nextIndex) {
     } catch (e) { logError("saveProgress", e); }
 }
 
+/** 在目前畫面找離 (x,y) 最近的目標，找不到回傳 null */
+function findNearestTarget(img, x, y) {
+    var hits = findTargets(img);
+    var best = null, bd = 1e9;
+    hits.forEach(function (h) {
+        var d = Math.abs(h.x - x) + Math.abs(h.y - y);
+        if (d < bd) { bd = d; best = h; }
+    });
+    return best;
+}
+
+/**
+ * 點目標 → 等泡泡 → 點泡泡 → 進詳情頁。
+ * 成功回傳 true；若一直停在地圖上回傳 false。
+ */
+function enterDetail(hit, label) {
+    var pc = CONFIG.popup;
+    var ox = sx(CONFIG.match.clickOffset.x), oy = sy(CONFIG.match.clickOffset.y);
+    var tx = Math.round(hit.x + ox), ty = Math.round(hit.y + oy);
+
+    for (var attempt = 0; attempt <= (pc.enabled ? pc.retries : 0); attempt++) {
+        info(label + " 點擊目標 (" + tx + "," + ty + ") 相似度 " + hit.sim.toFixed(3));
+        click(tx, ty);
+
+        if (!pc.enabled) { nap(CONFIG.timing.afterTapMonster); return true; }
+
+        nap(pc.waitAfterTapTarget);
+        var img = grab();
+        var p = POPUP_IMG ? images.findImage(img, POPUP_IMG, { threshold: pc.threshold }) : null;
+        var bx, by;
+        if (p) {
+            bx = p.x + POPUP_IMG.getWidth() / 2;
+            by = p.y + POPUP_IMG.getHeight() / 2;
+            info("找到名稱泡泡，點擊 (" + Math.round(bx) + "," + Math.round(by) + ")");
+        } else {
+            // 地圖可能被移動過，重新找目標位置再用固定偏移
+            var again = findNearestTarget(img, hit.x, hit.y) || hit;
+            bx = again.x + sx(pc.fallbackOffset.x);
+            by = again.y + sy(pc.fallbackOffset.y);
+            warn("沒找到泡泡，改點目標上方 (" + Math.round(bx) + "," + Math.round(by) + ")");
+            tx = Math.round(again.x + ox); ty = Math.round(again.y + oy);
+        }
+        click(Math.round(bx), Math.round(by));
+        nap(CONFIG.timing.afterTapMonster);
+
+        // 有 anchor 就確認真的離開地圖了
+        var onMap = isOnMap();
+        if (onMap === null || onMap === false) return true;
+        warn("仍在地圖畫面，重試進入詳情頁（" + (attempt + 1) + "）");
+    }
+    return false;
+}
+
 // ============================================================================
 // =                     核心：處理一隻目標怪                                  =
 // ============================================================================
@@ -794,11 +870,8 @@ function handleTarget(hit, cellShotPath, label) {
     var detailImg = null;
 
     try {
-        // ---- 1. 點擊怪物 ----
-        var ox = sx(CONFIG.match.clickOffset.x), oy = sy(CONFIG.match.clickOffset.y);
-        info(label + " 點擊目標怪 (" + Math.round(hit.x + ox) + "," + Math.round(hit.y + oy) + ") 相似度 " + hit.sim.toFixed(3));
-        click(Math.round(hit.x + ox), Math.round(hit.y + oy));
-        nap(CONFIG.timing.afterTapMonster);
+        // ---- 1. 點擊目標 → 點名稱泡泡 → 進詳情頁 ----
+        if (!enterDetail(hit, label)) throw new Error("無法進入詳情頁");
 
         // 詳情頁截圖先存一份（之後已離開此頁，OCR 時要用）
         detailImg = images.copy(grab());

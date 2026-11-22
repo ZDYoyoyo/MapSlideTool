@@ -1,0 +1,8 @@
+{
+  "files": [
+    ["map_scan.js", "/sdcard/脚本/map_scan.js"],
+    ["templates/map_anchor.png", "/sdcard/MapScan/templates/map_anchor.png"],
+    ["templates/popup_arrow.png", "/sdcard/MapScan/templates/popup_arrow.png"],
+    ["templates/targets/glowing_mushroom.png", "/sdcard/MapScan/templates/targets/glowing_mushroom.png"]
+  ]
+}
