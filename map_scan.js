@@ -257,9 +257,9 @@ var CONFIG = {
         showConsole: true,          // 顯示懸浮 console
         // console 視窗位置 [x,y,w,h]：放在左上角，不擋地圖比對範圍和底部按鈕
         // （截圖會拍到 console，點擊也會被它擋住，所以要放在 match.region 以外）
-        consoleRect: [0, 60, 860, 280],
-        // 懸浮「停止」按鈕位置 [x,y,w,h]（放右上角狀態列附近，不擋地圖比對範圍）；不要就設 null
-        stopButton: [870, 40, 190, 110],
+        consoleRect: [0, 60, 680, 280],
+        // 懸浮「暫停／停止」按鈕位置 [x,y,w,h]（右上角，不擋地圖比對範圍）；不要就設 null
+        stopButton: [690, 40, 380, 110],
         saveDetailShots: false,     // 額外保存詳情頁截圖
         saveMapsShots: false        // 額外保存 Google Maps 截圖
     }
@@ -269,6 +269,7 @@ var CONFIG = {
 // =                              全域狀態                                     =
 // ============================================================================
 var STOP = new java.util.concurrent.atomic.AtomicBoolean(false);
+var PAUSED = new java.util.concurrent.atomic.AtomicBoolean(false);
 var REAL_W = 0, REAL_H = 0;       // 實際截圖解析度
 var TEMPLATES = [];               // [{path, img}]
 var ANCHOR_IMG = null;
@@ -1287,6 +1288,7 @@ function scanCell(index, total) {
     };
 
     for (var round = 0; ; round++) {
+        if (round > 0) checkPause();
         var img = grab();
         var hits = findTargets(img).filter(function (h) { return !isHandled(h); });
         if (round === 0) info("格 " + (index + 1) + "/" + total + " [" + label + "] 比對到 " + hits.length + " 個目標");
@@ -1394,26 +1396,53 @@ function setup() {
     loadExistingRecords();
 }
 
-/** 右上角懸浮「停止」按鈕：按下後在安全點停止並保存進度 */
-var STOP_BTN = null;
+/** 右上角懸浮「暫停／停止」按鈕 */
+var CTRL_WIN = null;
 function showStopButton() {
     var b = CONFIG.debug.stopButton;
     if (!b) return;
     try {
-        STOP_BTN = floaty.rawWindow(
-            '<frame><button id="stop" text="停止" textSize="14sp" bg="#cc3333" textColor="#ffffff" w="*" h="*"/></frame>');
+        CTRL_WIN = floaty.rawWindow(
+            '<horizontal>' +
+            '<button id="pause" text="暫停" textSize="14sp" bg="#2e7d32" textColor="#ffffff" layout_weight="1" h="*"/>' +
+            '<button id="stop" text="停止" textSize="14sp" bg="#cc3333" textColor="#ffffff" layout_weight="1" h="*"/>' +
+            '</horizontal>');
         var dm = context.getResources().getDisplayMetrics();
         var fx = dm.widthPixels / CONFIG.screen.designWidth, fy = dm.heightPixels / CONFIG.screen.designHeight;
-        STOP_BTN.setSize(Math.round(b[2] * fx), Math.round(b[3] * fy));
-        STOP_BTN.setPosition(Math.round(b[0] * fx), Math.round(b[1] * fy));
-        STOP_BTN.stop.click(function () {
+        CTRL_WIN.setSize(Math.round(b[2] * fx), Math.round(b[3] * fy));
+        CTRL_WIN.setPosition(Math.round(b[0] * fx), Math.round(b[1] * fy));
+
+        CTRL_WIN.pause.click(function () {
+            if (STOP.get()) return;
+            var nowPaused = !PAUSED.get();
+            PAUSED.set(nowPaused);
+            CTRL_WIN.pause.setText(nowPaused ? "繼續" : "暫停");
+            CTRL_WIN.pause.attr("bg", nowPaused ? "#f9a825" : "#2e7d32");
+            toast(nowPaused ? "處理完目前這一步就暫停" : "繼續掃描");
+        });
+        CTRL_WIN.stop.click(function () {
             STOP.set(true);
+            PAUSED.set(false);
+            CTRL_WIN.stop.setText("停止中…");
             toast("收到停止，處理完目前步驟就停（進度會保存）");
-            ui.run(function () { STOP_BTN.stop.setText("停止中…"); });
         });
     } catch (e) {
-        warn("無法顯示停止按鈕：" + e + "（請用 Autox.js 管理頁停止）");
+        warn("無法顯示暫停/停止按鈕：" + e + "（請用 Autox.js 管理頁停止）");
     }
+}
+
+/**
+ * 暫停點：只在「地圖畫面、兩個步驟之間」檢查，暫停時畫面狀態是完整的。
+ * 暫停期間可以切去用別的 App，但「不要移動遊戲地圖」，否則網格會錯位。
+ */
+function checkPause() {
+    if (!PAUSED.get()) return;
+    info("⏸ 已暫停（按「繼續」恢復；暫停期間請不要移動遊戲地圖）");
+    var mark = new Date();
+    while (PAUSED.get() && !STOP.get()) sleep(500);
+    if (STOP.get()) throw new Error("STOP_REQUESTED");
+    info("▶ 繼續（暫停了 " + Math.round((Date.now() - mark.getTime()) / 1000) + " 秒）");
+    ensureOnMap();   // 暫停時若切去別的 App，先切回遊戲地圖
 }
 
 /**
@@ -1478,6 +1507,7 @@ function mainLoop() {
     var found = 0, failStreak = 0;
     for (var i = start; i < total; i++) {
         if (STOP.get()) break;
+        checkPause();
         var cell = cellOf(i);
         var ok = false;
         try {
@@ -1532,7 +1562,7 @@ var worker = threads.start(function () {
         TEMPLATES.forEach(function (t) { try { t.img.recycle(); } catch (e) { } });
         if (ANCHOR_IMG) { try { ANCHOR_IMG.recycle(); } catch (e) { } }
         try { device.cancelKeepingAwake(); } catch (e) { }
-        try { if (STOP_BTN) STOP_BTN.close(); } catch (e) { }
+        try { if (CTRL_WIN) CTRL_WIN.close(); } catch (e) { }
     }
 });
 
