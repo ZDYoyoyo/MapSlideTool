@@ -87,6 +87,26 @@ var CONFIG = {
         maxTargetsPerCell: 3        // 每格最多處理幾隻
     },
 
+    // ---------------- 加速 ①：推算位置，已記錄的目標不再點進去 ----------------
+    // 每次點進去拿到精確座標時，會用「目標在畫面上的位置 + 比例尺」校正地圖基準點；
+    // 之後滑動就依滑動距離推算畫面上每個目標的大概經緯度。
+    // 推算位置附近已有紀錄 → 只更新人數（約 1 秒），不開 Google Maps（約 10~20 秒）
+    fastSkip: {
+        enabled: true,
+        radiusMeters: 60,           // 推算位置與已記錄目標距離在此內 → 視為同一顆
+        maxSwipesSinceCalib: 40     // 距上次校正超過幾次滑動，就不信任推算（強制點進去重新校正）
+    },
+
+    // ---------------- 加速 ②：空地（沒有道路）快速略過 ----------------
+    // 菇只長在地標附近，沒有道路的空地/海面不會有菇。
+    // 滑動後先檢查畫面上「道路（亮色線條）」的比例，太低就直接跳下一格，不等物件刷出
+    emptySkip: {
+        enabled: true,
+        brightThreshold: 200,       // 灰階亮度高於此值視為道路像素（草地約 150、道路約 220）
+        minRoadRatio: 0.01,         // 道路像素比例低於此值 → 空地（市區實測 6~12%，無路草地約 0.2%）
+        confirmMs: 1500             // 最多等多久確認是空地（等地圖圖磚載入，網路慢就調長）
+    },
+
     // ---------------- 參加人數（人頭圖案旁的數字） ----------------
     // 在地圖截圖上，以「目標樣板中心」為基準，往右上方框出數字所在區域做 OCR
     players: {
@@ -105,7 +125,7 @@ var CONFIG = {
         threshold: 0.85,
         // 找不到泡泡時的備援：點「目標中心 + 這個偏移」（泡泡約在蘑菇傘上方 165px）
         fallbackOffset: { x: 0, y: -165 },
-        waitAfterTapTarget: 1500,   // 點蘑菇後等泡泡出現（地圖會稍微移動）
+        waitAfterTapTarget: 2500,   // 點蘑菇後最多等多久讓泡泡出現（一出現就點，不會等滿）
         retries: 2                  // 點完泡泡仍停在地圖上時，重試幾次
     },
 
@@ -200,9 +220,14 @@ var CONFIG = {
     },
 
     // ---------------- 等待時間（ms） ----------------
+    // 標「最多」的是上限：條件一達成就繼續，不會等滿
     timing: {
+        pollInterval: 300,          // 偵測畫面變化的間隔
+        detailMaxWait: 4000,        // 點泡泡後，最多等多久進入詳情頁
+        detailSettle: 700,          // 進入詳情頁後等動畫結束（按鈕才點得到）
+        mapsReadTimeout: 7000,      // Google Maps 開啟後，最多等多久讀到座標文字
+        mapReturnMaxWait: 5000,     // 切回遊戲後，最多等多久出現地圖畫面
         afterTapMonster: 3000,      // 點泡泡後等詳情頁（含進場動畫）
-        afterOpenMap: 3500,         // Google Maps 出現後再等它載入完
         waitMapsTimeout: 12000,     // 等 Google Maps 進前景的最長時間
         afterBack: 1500,
         afterLaunchGame: 3500,
@@ -245,6 +270,7 @@ var REAL_W = 0, REAL_H = 0;       // 實際截圖解析度
 var TEMPLATES = [];               // [{path, img}]
 var ANCHOR_IMG = null;
 var POPUP_IMG = null;
+var GEO_REF = null;               // 推算用基準點 {lat, lng, px, py, swipes}：(px,py) 是該經緯度目前在螢幕上的位置
 var RECORDS = [];                 // found.csv 全部紀錄 [{t(上次看到 ms), lat, lng, row[欄位]}]
 
 // ============================================================================
@@ -363,6 +389,18 @@ function waitForPackage(pkgs, timeoutMs) {
         nap(300);
     }
     return null;
+}
+
+/** 每隔 interval 呼叫 fn，直到回傳 truthy 值或逾時；回傳該值或 null */
+function waitUntil(fn, timeoutMs, interval) {
+    var end = Date.now() + timeoutMs;
+    interval = interval || CONFIG.timing.pollInterval;
+    while (true) {
+        var v = fn();
+        if (v) return v;
+        if (Date.now() >= end) return null;
+        nap(interval);
+    }
 }
 
 /** 截圖（含重試）。注意：captureScreen 回傳的圖會被重複利用，要長期保存請 images.copy */
@@ -673,37 +711,44 @@ function findTargets(img) {
     return merged;
 }
 
-function isOnMap() {
+function isOnMap(img) {
     if (!ANCHOR_IMG) return null; // 未設定，無法判斷
-    var img = grab();
+    img = img || grab();
     var opt = { threshold: CONFIG.mapAnchor.threshold };
     var reg = scaleRegion(CONFIG.mapAnchor.region);
     if (reg) opt.region = reg;
     return !!images.findImage(img, ANCHOR_IMG, opt);
 }
 
-/** 確保回到遊戲地圖畫面 */
+/** 切回遊戲並等它進前景 */
+function bringGameToFront() {
+    info("目前前景：" + currentPackage() + "，切回遊戲");
+    app.launch(CONFIG.gamePackage);
+    if (!waitForPackage([CONFIG.gamePackage], 15000)) throw new Error("無法切回遊戲");
+}
+
+/** 確保回到遊戲地圖畫面（偵測到地圖就立刻繼續，不等滿） */
 function ensureOnMap() {
-    if (currentPackage() !== CONFIG.gamePackage) {
-        info("目前前景：" + currentPackage() + "，切回遊戲");
-        app.launch(CONFIG.gamePackage);
-        if (!waitForPackage([CONFIG.gamePackage], 15000)) throw new Error("無法切回遊戲");
-        nap(CONFIG.timing.afterLaunchGame);
+    var launched = false;
+    if (currentPackage() !== CONFIG.gamePackage) { bringGameToFront(); launched = true; }
+    if (!ANCHOR_IMG) { if (launched) nap(CONFIG.timing.afterLaunchGame); return true; }
+
+    // 剛切回來畫面可能還在轉場，先等一下看會不會自己出現地圖
+    if (waitUntil(function () { return isOnMap(); }, CONFIG.timing.mapReturnMaxWait / 2)) {
+        info("已確認回到地圖畫面");
+        return true;
     }
-    if (ANCHOR_IMG) {
-        for (var i = 0; i <= CONFIG.mapAnchor.maxBackPresses; i++) {
-            if (isOnMap()) { info("已確認回到地圖畫面"); return true; }
-            info("尚未回到地圖，按返回（" + (i + 1) + "）");
-            pressBack();
-            if (currentPackage() !== CONFIG.gamePackage) {   // 按過頭跳出遊戲
-                app.launch(CONFIG.gamePackage);
-                waitForPackage([CONFIG.gamePackage], 15000);
-                nap(CONFIG.timing.afterLaunchGame);
-            }
+    for (var i = 0; i < CONFIG.mapAnchor.maxBackPresses; i++) {
+        info("尚未回到地圖，按返回（" + (i + 1) + "）");
+        var bb = CONFIG.taps.backButton;
+        if (bb.useSystemBack) back(); else tap(bb.x, bb.y, "返回鈕");
+        if (currentPackage() !== CONFIG.gamePackage) bringGameToFront();   // 按過頭跳出遊戲
+        if (waitUntil(function () { return isOnMap(); }, CONFIG.timing.mapReturnMaxWait / 2)) {
+            info("已確認回到地圖畫面");
+            return true;
         }
-        throw new Error("多次返回仍找不到地圖 anchor");
     }
-    return true;
+    throw new Error("多次返回仍找不到地圖 anchor");
 }
 
 // ============================================================================
@@ -724,6 +769,12 @@ function panView(dir) {
     else if (dir === "down") { y1 = cy + hy; y2 = cy - hy; }
     else if (dir === "up") { y1 = cy - hy; y2 = cy + hy; }
     var p1 = [sx(x1), sy(y1)], p2 = [sx(x2), sy(y2)];
+    // 地圖跟著手指移動：基準點在螢幕上的位置也跟著位移
+    if (GEO_REF) {
+        GEO_REF.px += p2[0] - p1[0];
+        GEO_REF.py += p2[1] - p1[1];
+        GEO_REF.swipes++;
+    }
     if (c.holdAtEnd) {
         // 最後一段停在終點不動，讓地圖不會甩出慣性
         gesture(c.duration, p1, p2, p2);
@@ -837,17 +888,29 @@ function loadExistingRecords() {
     info("已載入既有紀錄 " + RECORDS.length + " 筆");
 }
 
-/** 找出同一顆目標的既有紀錄（距離夠近，且上次看到的時間在 windowMinutes 內） */
-function findDuplicate(c, nowMs) {
+/** 找出同一顆目標的既有紀錄（距離 radius 內，且上次看到的時間在 windowMinutes 內）；radius 預設 dedupe.distanceMeters */
+function findDuplicate(c, nowMs, radius) {
+    radius = radius || CONFIG.dedupe.distanceMeters;
     var win = CONFIG.dedupe.windowMinutes * 60000;
     var best = null, bestD = 1e9;
     for (var i = 0; i < RECORDS.length; i++) {
         var r = RECORDS[i];
         if (win > 0 && Math.abs(nowMs - r.t) > win) continue;
         var d = haversine(r, c);
-        if (d <= CONFIG.dedupe.distanceMeters && d < bestD) { best = r; bestD = d; }
+        if (d <= radius && d < bestD) { best = r; bestD = d; }
     }
     return best;
+}
+
+/** 只更新既有紀錄的人數與最後看到時間（快速略過時使用） */
+function touchRecord(rec, players) {
+    var now = new Date();
+    rec.t = now.getTime();
+    var old = rec.row[4];
+    if (players !== null && players !== undefined) rec.row[4] = String(players);
+    rec.row[5] = fmtTime(now);
+    rewriteCsv();
+    return old;
 }
 
 /**
@@ -901,6 +964,77 @@ function saveProgress(nextIndex, mapAt) {
             nextIndex: nextIndex, mapAt: mapAt, cols: CONFIG.grid.cols, rows: CONFIG.grid.rows, updated: fmtTime()
         }));
     } catch (e) { logError("saveProgress", e); }
+}
+
+// ============================================================================
+// =                    加速：位置推算 / 空地判斷                              =
+// ============================================================================
+/** 每個「實際螢幕像素」代表幾公尺 */
+function metersPerRealPx() {
+    var g = CONFIG.grid;
+    return {
+        x: g.metersPerPixelX * CONFIG.screen.designWidth / REAL_W,
+        y: g.metersPerPixelY * CONFIG.screen.designHeight / REAL_H
+    };
+}
+
+/** 依基準點推算螢幕上 (px,py) 的經緯度；沒有可信的基準點回傳 null */
+function estimateGeo(px, py) {
+    if (!GEO_REF || GEO_REF.swipes > CONFIG.fastSkip.maxSwipesSinceCalib) return null;
+    var m = metersPerRealPx();
+    var east = (px - GEO_REF.px) * m.x;
+    var north = -(py - GEO_REF.py) * m.y;      // 螢幕往下 = 往南
+    return {
+        lat: GEO_REF.lat + north / 111320,
+        lng: GEO_REF.lng + east / (111320 * Math.cos(GEO_REF.lat * Math.PI / 180))
+    };
+}
+
+/** 用一個「精確經緯度 + 它目前在螢幕上的位置」校正基準點 */
+function calibrate(coords, px, py) {
+    var est = estimateGeo(px, py);
+    if (est) info("位置推算誤差 " + Math.round(haversine(est, coords)) + " m（距上次校正 " + GEO_REF.swipes + " 次滑動）");
+    GEO_REF = { lat: coords.lat, lng: coords.lng, px: px, py: py, swipes: 0 };
+}
+
+/** 畫面比對範圍內的「道路（亮色像素）」比例，用來判斷空地；失敗回傳 1（當作非空地） */
+function roadRatio(img) {
+    var r = scaleRegion(CONFIG.match.region);
+    var sub = null, gray = null, bin = null;
+    try {
+        sub = images.clip(img, r[0], r[1], r[2], r[3]);
+        gray = images.grayscale(sub);
+        bin = images.threshold(gray, CONFIG.emptySkip.brightThreshold, 255, "BINARY");
+        var n = org.opencv.core.Core.countNonZero(bin.getMat());
+        return n / (r[2] * r[3]);
+    } catch (e) {
+        logError("roadRatio", e);
+        return 1;
+    } finally {
+        [sub, gray, bin].forEach(function (im) { if (im) { try { im.recycle(); } catch (e) { } } });
+    }
+}
+
+/**
+ * 滑動後等地圖載入。空地（道路很少）回傳 true，呼叫端可直接跳過這格。
+ * 非空地則等滿 swipe.waitAfter 讓目標刷出。
+ */
+function waitAfterSwipe() {
+    var es = CONFIG.emptySkip, t0 = Date.now();
+    if (!es.enabled) { nap(CONFIG.swipe.waitAfter); return false; }
+    var maxRatio = 0;
+    var hasRoad = waitUntil(function () {
+        var ratio = roadRatio(grab());
+        maxRatio = Math.max(maxRatio, ratio);
+        return ratio >= es.minRoadRatio;
+    }, es.confirmMs, 400);
+    if (!hasRoad) {
+        info("空地（道路比例 " + (maxRatio * 100).toFixed(2) + "%），略過");
+        return true;
+    }
+    var left = CONFIG.swipe.waitAfter - (Date.now() - t0);
+    if (left > 0) nap(left);
+    return false;
 }
 
 /** 把 OCR 常見誤認的字母轉回數字，取第一組數字 */
@@ -960,11 +1094,11 @@ function findNearestTarget(img, x, y) {
 }
 
 /**
- * 點目標 → 等泡泡 → 點泡泡 → 進詳情頁。
+ * 點目標 → 等泡泡 → 點泡泡 → 進詳情頁（每一步偵測到就繼續，不等滿）。
  * 成功回傳 true；若一直停在地圖上回傳 false。
  */
 function enterDetail(hit, label) {
-    var pc = CONFIG.popup;
+    var pc = CONFIG.popup, tm = CONFIG.timing;
     var ox = sx(CONFIG.match.clickOffset.x), oy = sy(CONFIG.match.clickOffset.y);
     var tx = Math.round(hit.x + ox), ty = Math.round(hit.y + oy);
 
@@ -972,30 +1106,33 @@ function enterDetail(hit, label) {
         info(label + " 點擊目標 (" + tx + "," + ty + ") 相似度 " + hit.sim.toFixed(3));
         click(tx, ty);
 
-        if (!pc.enabled) { nap(CONFIG.timing.afterTapMonster); return true; }
-
-        nap(pc.waitAfterTapTarget);
-        var img = grab();
-        var p = POPUP_IMG ? images.findImage(img, POPUP_IMG, { threshold: pc.threshold }) : null;
-        var bx, by;
-        if (p) {
-            bx = p.x + POPUP_IMG.getWidth() / 2;
-            by = p.y + POPUP_IMG.getHeight() / 2;
-            info("找到名稱泡泡，點擊 (" + Math.round(bx) + "," + Math.round(by) + ")");
-        } else {
-            // 地圖可能被移動過，重新找目標位置再用固定偏移
-            var again = findNearestTarget(img, hit.x, hit.y) || hit;
-            bx = again.x + sx(pc.fallbackOffset.x);
-            by = again.y + sy(pc.fallbackOffset.y);
-            warn("沒找到泡泡，改點目標上方 (" + Math.round(bx) + "," + Math.round(by) + ")");
-            tx = Math.round(again.x + ox); ty = Math.round(again.y + oy);
+        if (pc.enabled) {
+            var last = null;
+            var p = POPUP_IMG ? waitUntil(function () {
+                last = grab();
+                return images.findImage(last, POPUP_IMG, { threshold: pc.threshold });
+            }, pc.waitAfterTapTarget) : null;
+            var bx, by;
+            if (p) {
+                bx = p.x + POPUP_IMG.getWidth() / 2;
+                by = p.y + POPUP_IMG.getHeight() / 2;
+                info("找到名稱泡泡，點擊 (" + Math.round(bx) + "," + Math.round(by) + ")");
+            } else {
+                // 地圖可能被移動過，重新找目標位置再用固定偏移
+                var again = findNearestTarget(last || grab(), hit.x, hit.y) || hit;
+                bx = again.x + sx(pc.fallbackOffset.x);
+                by = again.y + sy(pc.fallbackOffset.y);
+                warn("沒找到泡泡，改點目標上方 (" + Math.round(bx) + "," + Math.round(by) + ")");
+                tx = Math.round(again.x + ox); ty = Math.round(again.y + oy);
+            }
+            click(Math.round(bx), Math.round(by));
         }
-        click(Math.round(bx), Math.round(by));
-        nap(CONFIG.timing.afterTapMonster);
 
-        // 有 anchor 就確認真的離開地圖了
-        var onMap = isOnMap();
-        if (onMap === null || onMap === false) return true;
+        // 等到離開地圖畫面（= 進入詳情頁）
+        if (!ANCHOR_IMG) { nap(tm.afterTapMonster); return true; }
+        var left = waitUntil(function () { return isOnMap() === false; }, tm.detailMaxWait);
+        if (left) { nap(tm.detailSettle); return true; }
+        if (!pc.enabled) return false;
         warn("仍在地圖畫面，重試進入詳情頁（" + (attempt + 1) + "）");
     }
     return false;
@@ -1006,7 +1143,7 @@ function enterDetail(hit, label) {
 // ============================================================================
 /**
  * 點怪 → 詳情 → (A)複製/節點文字 → 開 Google Map → (A)節點/分享 → (B)OCR → 記錄 → 回地圖
- * @return true=成功取得座標（含重複略過）
+ * @return 取得的座標 {lat,lng}，失敗回傳 null
  */
 function handleTarget(hit, cellShotPath, label, players) {
     var coords = null, ocrNotes = [];
@@ -1058,10 +1195,9 @@ function handleTarget(hit, cellShotPath, label, players) {
             if (!pkg) {
                 warn("Google Maps 未開啟（前景：" + currentPackage() + "）");
             } else {
-                nap(CONFIG.timing.afterOpenMap);
-
-                // ---- 5. 方法 A2：Google Maps 畫面文字（以座標開啟時搜尋列通常就是 lat,lng）----
-                coords = coordsFromScreenNodes();
+                // ---- 5. 方法 A2：Google Maps 畫面文字（以座標開啟時搜尋列就是 lat,lng）----
+                // 座標文字一出現就讀，不用等地圖整個載入
+                coords = waitUntil(coordsFromScreenNodes, CONFIG.timing.mapsReadTimeout, 400);
                 if (coords) info("方法 A2（Google Maps 節點文字）成功");
 
                 // ---- 6. 方法 A：Google Maps 分享 → 複製連結 ----
@@ -1108,7 +1244,7 @@ function handleTarget(hit, cellShotPath, label, players) {
         } else {
             recordUnresolved(cellShotPath, ocrNotes.join(" || ").replace(/\s+/g, " ").substr(0, 500), players);
         }
-        return !!coords;
+        return coords;
     } finally {
         if (detailImg) { try { detailImg.recycle(); } catch (e) { } }
         // ---- 10. 回到遊戲地圖 ----
@@ -1119,11 +1255,9 @@ function handleTarget(hit, cellShotPath, label, players) {
 function returnToGameMap() {
     try {
         var leftGame = currentPackage() !== CONFIG.gamePackage;
-        if (leftGame) {
-            // 從 Google Maps 回來：直接啟動遊戲（比狂按返回可靠）
-            app.launch(CONFIG.gamePackage);
-            waitForPackage([CONFIG.gamePackage], 15000);
-            nap(CONFIG.timing.afterLaunchGame);
+        if (leftGame) {   // 從 Google Maps 回來：直接啟動遊戲（比狂按返回可靠）
+            bringGameToFront();
+            if (!ANCHOR_IMG) nap(CONFIG.timing.afterLaunchGame);
         }
         if (ANCHOR_IMG) {
             ensureOnMap();
@@ -1143,45 +1277,74 @@ function scanCell(index, total) {
     var cell = cellOf(index);
     var label = "r" + cell.row + "c" + cell.col;
     var handled = [];      // 本格已處理過的螢幕位置
-    var count = 0;
+    var clicks = 0, quick = 0;
+    var near = sx(CONFIG.match.sameTargetRadius);
+    var isHandled = function (h) {
+        return handled.some(function (p) { return Math.abs(p.x - h.x) < near && Math.abs(p.y - h.y) < near; });
+    };
 
-    for (var round = 0; round < CONFIG.match.maxTargetsPerCell; round++) {
+    for (var round = 0; ; round++) {
         var img = grab();
-        var hits = findTargets(img).filter(function (h) {
-            var r = sx(CONFIG.match.sameTargetRadius);
-            return !handled.some(function (p) { return Math.abs(p.x - h.x) < r && Math.abs(p.y - h.y) < r; });
-        });
-        if (round === 0) {
-            info("格 " + (index + 1) + "/" + total + " [" + label + "] 比對到 " + hits.length + " 個目標");
-        }
+        var hits = findTargets(img).filter(function (h) { return !isHandled(h); });
+        if (round === 0) info("格 " + (index + 1) + "/" + total + " [" + label + "] 比對到 " + hits.length + " 個目標");
         if (!hits.length) break;
 
-        var hit = hits[0];
-        handled.push(hit);
-        var shotPath = saveShot(img, "target_" + fmtFileTime() + "_" + label + "_" + round);
-        // 點擊前先從地圖截圖讀參加人數（點下去後地圖會移動）
-        var players = readPlayerCount(img, hit);
-        info("參加人數：" + (players === null ? "讀不到" : players));
+        // ---- 先把「推算為已記錄」的目標快速處理掉（不點擊、地圖不會動）----
+        var unknown = null;
+        for (var k = 0; k < hits.length; k++) {
+            var h = hits[k];
+            var est = CONFIG.fastSkip.enabled ? estimateGeo(h.x, h.y) : null;
+            var rec = est ? findDuplicate(est, Date.now(), CONFIG.fastSkip.radiusMeters) : null;
+            if (rec) {
+                var pl = readPlayerCount(img, h);
+                var old = touchRecord(rec, pl);
+                info("快速略過：推定為已記錄的 " + rec.row[1] + "," + rec.row[2] +
+                    "（距推算 " + Math.round(haversine(rec, est)) + " m），人數 " +
+                    (old === "" ? "?" : old) + " → " + (pl === null ? "讀不到" : pl));
+                handled.push(h);
+                quick++;
+            } else if (!unknown) {
+                unknown = h;
+            }
+        }
+        if (!unknown || clicks >= CONFIG.match.maxTargetsPerCell) break;
 
+        // ---- 新目標：點進去拿精確座標 ----
+        var hit = unknown;
+        handled.push(hit);
+        var shotPath = saveShot(img, "target_" + fmtFileTime() + "_" + label + "_" + clicks);
+        var players = readPlayerCount(img, hit);   // 點擊前先讀人數（點下去後地圖會移動）
+        info("參加人數：" + (players === null ? "讀不到" : players));
+        var coords = null;
         try {
-            withRetry("處理目標 " + label + "#" + round, 2, function (attempt) {
+            withRetry("處理目標 " + label + "#" + clicks, 2, function (attempt) {
                 if (attempt > 1) ensureOnMap();
-                handleTarget(hit, shotPath, label + "#" + round, players);
+                coords = handleTarget(hit, shotPath, label + "#" + clicks, players);
             });
-            count++;
         } catch (e) {
             if (String(e).indexOf("STOP_REQUESTED") >= 0) throw e;
-            logError("處理目標 " + label + "#" + round, e);
+            logError("處理目標 " + label + "#" + clicks, e);
             ensureOnMap();
         }
+        clicks++;
 
         // 遊戲回來後若會自動置中，重播到目前這格
         if (CONFIG.grid.recenterOnReturn) {
             fastForwardTo(index);
             nap(CONFIG.swipe.waitAfter);
         }
+
+        // ---- 校正推算基準：點擊後地圖會稍微移動，重新找到這顆在畫面上的新位置 ----
+        if (coords) {
+            var after = findNearestTarget(grab(), hit.x, hit.y);
+            if (after && Math.abs(after.x - hit.x) + Math.abs(after.y - hit.y) < sx(250)) {
+                calibrate(coords, after.x, after.y);
+                // 已處理清單改用新位置，避免地圖移動後同一顆被當成新的
+                handled[handled.length - 1] = after;
+            }
+        }
     }
-    return count;
+    return clicks + quick;
 }
 
 // ============================================================================
@@ -1293,8 +1456,8 @@ function mainLoop() {
                 info("→ 滑動 " + dir + "，前往格 " + (i + 1) + "/" + total + " [r" + cell.row + "c" + cell.col + "]");
                 withRetry("滑動", CONFIG.retry.perAction, function () { panView(dir); });
                 mapAt = i;
-                nap(CONFIG.swipe.waitAfter);
             }
+            if (waitAfterSwipe()) ok = true;          // 空地：直接跳下一格
             for (var t = 0; t <= CONFIG.retry.perCell && !ok; t++) {
                 try {
                     found += scanCell(i, total);
