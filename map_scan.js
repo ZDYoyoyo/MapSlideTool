@@ -270,6 +270,7 @@ var CONFIG = {
 // ============================================================================
 var STOP = new java.util.concurrent.atomic.AtomicBoolean(false);
 var PAUSED = new java.util.concurrent.atomic.AtomicBoolean(false);
+var RUN_START = 0, PAUSED_MS = 0, CELLS_DONE = 0, TARGETS_DONE = 0;   // 本次執行統計
 var REAL_W = 0, REAL_H = 0;       // 實際截圖解析度
 var TEMPLATES = [];               // [{path, img}]
 var ANCHOR_IMG = null;
@@ -299,6 +300,13 @@ function parseTime(s) {
     var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(String(s).trim());
     if (!m) return NaN;
     return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+}
+
+/** 毫秒 → "1 小時 02 分 05 秒" */
+function fmtDuration(ms) {
+    var t = Math.max(0, Math.round(ms / 1000));
+    var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), sec = t % 60;
+    return (h ? h + " 小時 " : "") + (h || m ? pad2(m) + " 分 " : "") + pad2(sec) + " 秒";
 }
 
 function info(msg) { console.log("[" + fmtTime() + "] " + msg); }
@@ -1441,7 +1449,8 @@ function checkPause() {
     var mark = new Date();
     while (PAUSED.get() && !STOP.get()) sleep(500);
     if (STOP.get()) throw new Error("STOP_REQUESTED");
-    info("▶ 繼續（暫停了 " + Math.round((Date.now() - mark.getTime()) / 1000) + " 秒）");
+    PAUSED_MS += Date.now() - mark.getTime();
+    info("▶ 繼續（暫停了 " + fmtDuration(Date.now() - mark.getTime()) + "）");
     ensureOnMap();   // 暫停時若切去別的 App，先切回遊戲地圖
 }
 
@@ -1477,6 +1486,7 @@ function decideStart(total) {
 }
 
 function mainLoop() {
+    RUN_START = Date.now();
     setup();
 
     var g = CONFIG.grid;
@@ -1520,7 +1530,9 @@ function mainLoop() {
             if (waitAfterSwipe()) ok = true;          // 空地：直接跳下一格
             for (var t = 0; t <= CONFIG.retry.perCell && !ok; t++) {
                 try {
-                    found += scanCell(i, total);
+                    var n = scanCell(i, total);
+                    found += n;
+                    TARGETS_DONE += n;
                     ok = true;
                 } catch (e) {
                     if (String(e).indexOf("STOP_REQUESTED") >= 0) throw e;
@@ -1534,6 +1546,7 @@ function mainLoop() {
             logError("格 " + (i + 1), e);   // 單格失敗不中斷整體
         }
         saveProgress(i + 1, mapAt);
+        CELLS_DONE++;
 
         failStreak = ok ? 0 : failStreak + 1;
         if (failStreak >= CONFIG.retry.maxConsecutiveFailedCells) {
@@ -1563,6 +1576,13 @@ var worker = threads.start(function () {
         if (ANCHOR_IMG) { try { ANCHOR_IMG.recycle(); } catch (e) { } }
         try { device.cancelKeepingAwake(); } catch (e) { }
         try { if (CTRL_WIN) CTRL_WIN.close(); } catch (e) { }
+        if (RUN_START) {
+            var total = Date.now() - RUN_START;
+            info("⏱ 本次執行 " + fmtDuration(total) +
+                (PAUSED_MS ? "（暫停 " + fmtDuration(PAUSED_MS) + "，實際掃描 " + fmtDuration(total - PAUSED_MS) + "）" : "") +
+                "，掃了 " + CELLS_DONE + " 格、處理目標 " + TARGETS_DONE + " 隻" +
+                (CELLS_DONE ? "，平均每格 " + ((total - PAUSED_MS) / CELLS_DONE / 1000).toFixed(1) + " 秒" : ""));
+        }
     }
 });
 
