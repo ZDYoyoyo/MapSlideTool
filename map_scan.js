@@ -32,7 +32,8 @@
  *   換手機或遊戲改版時，再重量 taps / region 相關座標。
  *
  * 【輸出】
- *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path
+ *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path,players
+ *                                    （players = 地圖上人頭圖案旁的參加人數，讀不到則留空）
  *   /sdcard/MapScan/unresolved.csv   找到怪但拿不到經緯度的（含 OCR 原文）
  *   /sdcard/MapScan/errors.log       錯誤紀錄
  *   /sdcard/MapScan/progress.json    續跑進度
@@ -83,6 +84,16 @@ var CONFIG = {
         clickOffset: { x: 0, y: 30 },// 點擊位置相對於樣板中心的偏移（樣板是蘑菇傘，往下點一點較穩）
         sameTargetRadius: 120,      // 同一格內，距離小於此值（px）視為同一隻，不重點
         maxTargetsPerCell: 3        // 每格最多處理幾隻
+    },
+
+    // ---------------- 參加人數（人頭圖案旁的數字） ----------------
+    // 在地圖截圖上，以「目標樣板中心」為基準，往右上方框出數字所在區域做 OCR
+    players: {
+        enabled: true,
+        // [dx, dy, w, h]：相對於樣板中心的偏移與大小（依你 5 張截圖量測，人頭在蘑菇傘右上方）
+        region: [36, -98, 88, 52],
+        scale: 3,                   // 放大幾倍再辨識（數字很小，放大較準）
+        language: "la"              // gmlkit 用拉丁字母模型辨識數字較準
     },
 
     // ---------------- 點目標後的名稱泡泡 ----------------
@@ -546,14 +557,15 @@ function ocrResultToText(r) {
     return arr.join("\n");
 }
 
-function runOcr(img) {
+function runOcr(img, lang) {
     var cfg = CONFIG.ocr;
+    lang = lang || cfg.language;
     var engine = cfg.engine;
     if (engine === "custom" || (engine === "auto" && typeof cfg.customOcr === "function")) {
         if (typeof cfg.customOcr === "function") return String(cfg.customOcr(img) || "");
     }
     if ((engine === "auto" || engine === "gmlkit") && typeof gmlkit !== "undefined" && gmlkit.ocr) {
-        return ocrResultToText(gmlkit.ocr(img, cfg.language));
+        return ocrResultToText(gmlkit.ocr(img, lang));
     }
     if ((engine === "auto" || engine === "paddle") && typeof paddle !== "undefined") {
         if (paddle.ocrText) return ocrResultToText(paddle.ocrText(img));
@@ -748,13 +760,23 @@ function haversine(a, b) {
     return 2 * R * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
 }
 
+var CSV_HEADER = "timestamp,lat,lng,screenshot_path,players";
+
 function loadExistingRecords() {
     var p = CONFIG.paths.logCsv;
     if (!files.exists(p)) {
-        files.write(p, "timestamp,lat,lng,screenshot_path\n");
+        files.write(p, CSV_HEADER + "\n");
         return;
     }
-    var lines = String(files.read(p)).split(/\r?\n/);
+    var content = String(files.read(p));
+    var lines = content.split(/\r?\n/);
+    if (lines[0].trim() !== CSV_HEADER) {
+        // 舊格式（沒有 players 欄）：備份舊檔，開新檔；舊資料仍用於去重
+        var bak = p.replace(/\.csv$/, "") + "_old_" + fmtFileTime() + ".csv";
+        files.write(bak, content);
+        files.write(p, CSV_HEADER + "\n");
+        info("found.csv 是舊格式，已備份為 " + bak + " 並建立新檔");
+    }
     for (var i = 1; i < lines.length; i++) {
         var f = lines[i].split(",");
         if (f.length < 3) continue;
@@ -780,23 +802,25 @@ function csvEscape(s) {
 }
 
 /** 寫入 found.csv；重複則略過。回傳 true=已寫入 */
-function recordCoords(c, shotPath) {
+function recordCoords(c, shotPath, players) {
     var now = new Date();
     if (isDuplicate(c, now.getTime())) {
         info("座標 " + c.lat + "," + c.lng + " 與近期紀錄重複，略過");
         return false;
     }
-    var line = [fmtTime(now), c.lat.toFixed(6), c.lng.toFixed(6), csvEscape(shotPath)].join(",");
+    var line = [fmtTime(now), c.lat.toFixed(6), c.lng.toFixed(6), csvEscape(shotPath),
+        (players === null || players === undefined) ? "" : players].join(",");
     files.append(CONFIG.paths.logCsv, line + "\n");
     RECORDS.push({ t: now.getTime(), lat: c.lat, lng: c.lng });
     info("★ 已記錄：" + line);
     return true;
 }
 
-function recordUnresolved(shotPath, note) {
+function recordUnresolved(shotPath, note, players) {
     var p = CONFIG.paths.unresolvedCsv;
     if (!files.exists(p)) files.write(p, "timestamp,screenshot_path,note\n");
-    files.append(p, [fmtTime(), csvEscape(shotPath), csvEscape(note)].join(",") + "\n");
+    var pl = (players === null || players === undefined) ? "" : "players=" + players + " ";
+    files.append(p, [fmtTime(), csvEscape(shotPath), csvEscape(pl + note)].join(",") + "\n");
     warn("找到目標但無法取得座標，已寫入 unresolved.csv");
 }
 
@@ -818,6 +842,51 @@ function saveProgress(nextIndex, mapAt) {
             nextIndex: nextIndex, mapAt: mapAt, cols: CONFIG.grid.cols, rows: CONFIG.grid.rows, updated: fmtTime()
         }));
     } catch (e) { logError("saveProgress", e); }
+}
+
+/** 把 OCR 常見誤認的字母轉回數字，取第一組數字 */
+function digitsFromOcr(txt) {
+    var t = String(txt || "")
+        .replace(/[Oo]/g, "0").replace(/[lI|i!]/g, "1").replace(/[B]/g, "8")
+        .replace(/[Ss]/g, "5").replace(/[Zz]/g, "2").replace(/[q]/g, "9");
+    var m = /\d{1,3}/.exec(t);
+    return m ? parseInt(m[0], 10) : null;
+}
+
+/**
+ * 讀取目標旁人頭圖案的參加人數。img 必須是「點擊前」的地圖截圖。
+ * 讀不到回傳 null（例如還沒人參加時沒有人頭標籤）
+ */
+function readPlayerCount(img, hit) {
+    var pc = CONFIG.players;
+    if (!pc || !pc.enabled) return null;
+    var x = Math.round(hit.x + sx(pc.region[0])), y = Math.round(hit.y + sy(pc.region[1]));
+    var w = sx(pc.region[2]), h = sy(pc.region[3]);
+    // 人數標籤若落在 console 視窗底下，讀到的會是 log 文字，直接放棄
+    if (CONFIG.debug.showConsole && y < sy(CONFIG.match.region[1]) - 10) return null;
+    x = Math.max(0, x); y = Math.max(0, y);
+    w = Math.min(w, REAL_W - x); h = Math.min(h, REAL_H - y);
+    if (w <= 4 || h <= 4) return null;
+
+    var sub = null, big = null, bin = null;
+    try {
+        sub = images.clip(img, x, y, w, h);
+        big = images.scale(sub, pc.scale, pc.scale);
+        var n = digitsFromOcr(runOcr(big, pc.language));
+        if (n === null) {
+            // 第二次：只留白色像素（數字是白色）再辨識
+            try {
+                bin = images.inRange(big, "#c0c0c0", "#ffffff");
+                n = digitsFromOcr(runOcr(bin, pc.language));
+            } catch (e) { }
+        }
+        return n;
+    } catch (e) {
+        logError("readPlayerCount", e);
+        return null;
+    } finally {
+        [sub, big, bin].forEach(function (im) { if (im) { try { im.recycle(); } catch (e) { } } });
+    }
 }
 
 /** 在目前畫面找離 (x,y) 最近的目標，找不到回傳 null */
@@ -880,7 +949,7 @@ function enterDetail(hit, label) {
  * 點怪 → 詳情 → (A)複製/節點文字 → 開 Google Map → (A)節點/分享 → (B)OCR → 記錄 → 回地圖
  * @return true=成功取得座標（含重複略過）
  */
-function handleTarget(hit, cellShotPath, label) {
+function handleTarget(hit, cellShotPath, label, players) {
     var coords = null, ocrNotes = [];
     var detailImg = null;
 
@@ -976,9 +1045,9 @@ function handleTarget(hit, cellShotPath, label) {
 
         // ---- 9. 寫紀錄 ----
         if (coords) {
-            recordCoords(coords, cellShotPath);
+            recordCoords(coords, cellShotPath, players);
         } else {
-            recordUnresolved(cellShotPath, ocrNotes.join(" || ").replace(/\s+/g, " ").substr(0, 500));
+            recordUnresolved(cellShotPath, ocrNotes.join(" || ").replace(/\s+/g, " ").substr(0, 500), players);
         }
         return !!coords;
     } finally {
@@ -1031,11 +1100,14 @@ function scanCell(index, total) {
         var hit = hits[0];
         handled.push(hit);
         var shotPath = saveShot(img, "target_" + fmtFileTime() + "_" + label + "_" + round);
+        // 點擊前先從地圖截圖讀參加人數（點下去後地圖會移動）
+        var players = readPlayerCount(img, hit);
+        info("參加人數：" + (players === null ? "讀不到" : players));
 
         try {
             withRetry("處理目標 " + label + "#" + round, 2, function (attempt) {
                 if (attempt > 1) ensureOnMap();
-                handleTarget(hit, shotPath, label + "#" + round);
+                handleTarget(hit, shotPath, label + "#" + round, players);
             });
             count++;
         } catch (e) {
