@@ -15,7 +15,8 @@
  *   2. 用相簿的「裁切」只框出目標本體一小塊（約 80~150 px 見方），
  *      不要框到上面會變動的數字/計時圈，也盡量少框地圖背景
  *   3. 放進 /sdcard/MapScan/templates/targets/（png 或 jpg 都可）
- *      資料夾裡「所有圖片」都會被當成目標，任一張比對到就算：
+ *      資料夾裡「所有圖片」都會被當成目標，任一張比對到就算；
+ *      檔名就是 found.csv 的 target 欄位（例如 巨大輝煌蘑菇.png → 巨大輝煌蘑菇）：
  *        - 換目標：刪掉舊圖、放新圖
  *        - 同時找多種目標：放多張
  *   4. map_anchor.png 放在 /sdcard/MapScan/templates/（地圖模式底部
@@ -32,7 +33,8 @@
  *   換手機或遊戲改版時，再重量 taps / region 相關座標。
  *
  * 【輸出】
- *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path,players,updated_at
+ *   /sdcard/MapScan/found.csv        timestamp,lat,lng,screenshot_path,players,updated_at,target
+ *                                    target = 目標種類（= targets 資料夾裡比對到的樣板檔名，不含副檔名）
  *                                    每顆目標一行；players = 人頭圖案旁的參加人數（讀不到留空），
  *                                    再次掃到同一顆會更新 players 與 updated_at（最後看到的時間）
  *   /sdcard/MapScan/unresolved.csv   找到怪但拿不到經緯度的（含 OCR 原文）
@@ -704,6 +706,12 @@ function loadTemplates() {
     }
 }
 
+/** 目標種類名稱 = 樣板檔名（去掉副檔名），例如 targets/巨大輝煌蘑菇.png → 「巨大輝煌蘑菇」 */
+function targetName(hit) {
+    if (!hit || !hit.tpl) return "";
+    return String(hit.tpl).replace(/^.*[\/\\]/, "").replace(/\.[^.]+$/, "");
+}
+
 /**
  * 在截圖中找出所有目標怪，回傳 [{x, y, sim, tpl}]（實際螢幕座標 = 樣板中心）
  * 已依相似度排序並合併過近的點
@@ -848,7 +856,7 @@ function haversine(a, b) {
 }
 
 // found.csv：每顆目標只有一行；再次掃到同一顆時更新 players 與 updated_at
-var CSV_HEADER = "timestamp,lat,lng,screenshot_path,players,updated_at";
+var CSV_HEADER = "timestamp,lat,lng,screenshot_path,players,updated_at,target";
 
 function csvEscape(s) {
     s = String(s == null ? "" : s);
@@ -902,7 +910,7 @@ function loadExistingRecords() {
         var lat = parseFloat(f[1]), lng = parseFloat(f[2]);
         if (!validLatLng(lat, lng)) continue;
         // 舊格式自動轉換：補上 players / updated_at 欄位
-        var row = [f[0], f[1], f[2], f[3] || "", f[4] || "", f[5] || f[0]];
+        var row = [f[0], f[1], f[2], f[3] || "", f[4] || "", f[5] || f[0], f[6] || ""];
         var t = parseTime(row[5]);
         RECORDS.push({ t: isNaN(t) ? 0 : t, lat: lat, lng: lng, row: row });
     }
@@ -916,13 +924,14 @@ function loadExistingRecords() {
 }
 
 /** 找出同一顆目標的既有紀錄（距離 radius 內，且上次看到的時間在 windowMinutes 內）；radius 預設 dedupe.distanceMeters */
-function findDuplicate(c, nowMs, radius) {
+function findDuplicate(c, nowMs, radius, target) {
     radius = radius || CONFIG.dedupe.distanceMeters;
     var win = CONFIG.dedupe.windowMinutes * 60000;
     var best = null, bestD = 1e9;
     for (var i = 0; i < RECORDS.length; i++) {
         var r = RECORDS[i];
         if (win > 0 && Math.abs(nowMs - r.t) > win) continue;
+        if (target && r.row[6] && r.row[6] !== target) continue;   // 不同種類的目標不算同一顆
         var d = haversine(r, c);
         if (d <= radius && d < bestD) { best = r; bestD = d; }
     }
@@ -930,9 +939,10 @@ function findDuplicate(c, nowMs, radius) {
 }
 
 /** 只更新既有紀錄的人數與最後看到時間（快速略過時使用） */
-function touchRecord(rec, players) {
+function touchRecord(rec, players, target) {
     var now = new Date();
     rec.t = now.getTime();
+    if (target && !rec.row[6]) rec.row[6] = target;
     var old = rec.row[4];
     if (players !== null && players !== undefined) rec.row[4] = String(players);
     rec.row[5] = fmtTime(now);
@@ -944,12 +954,13 @@ function touchRecord(rec, players) {
  * 寫入 found.csv。
  * 新目標 → 新增一行；已記錄過的同一顆 → 更新該行的人數與 updated_at。
  */
-function recordCoords(c, shotPath, players) {
+function recordCoords(c, shotPath, players, target) {
     var now = new Date(), nowStr = fmtTime(now);
     var pl = (players === null || players === undefined) ? "" : String(players);
-    var dup = findDuplicate(c, now.getTime());
+    var dup = findDuplicate(c, now.getTime(), null, target);
     if (dup) {
         dup.t = now.getTime();               // 以「最後看到的時間」計算去重時間窗
+        if (target && !dup.row[6]) dup.row[6] = target;
         var old = dup.row[4];
         if (pl !== "") dup.row[4] = pl;      // 這次讀不到人數就保留舊值
         dup.row[5] = nowStr;
@@ -958,17 +969,18 @@ function recordCoords(c, shotPath, players) {
             (old === "" ? "?" : old) + " → " + (dup.row[4] === "" ? "?" : dup.row[4]));
         return false;
     }
-    var row = [nowStr, c.lat.toFixed(6), c.lng.toFixed(6), shotPath || "", pl, nowStr];
+    var row = [nowStr, c.lat.toFixed(6), c.lng.toFixed(6), shotPath || "", pl, nowStr, target || ""];
     files.append(CONFIG.paths.logCsv, row.map(csvEscape).join(",") + "\n");
     RECORDS.push({ t: now.getTime(), lat: c.lat, lng: c.lng, row: row });
     info("★ 已記錄：" + row.join(","));
     return true;
 }
 
-function recordUnresolved(shotPath, note, players) {
+function recordUnresolved(shotPath, note, players, target) {
     var p = CONFIG.paths.unresolvedCsv;
     if (!files.exists(p)) files.write(p, "timestamp,screenshot_path,note\n");
-    var pl = (players === null || players === undefined) ? "" : "players=" + players + " ";
+    var pl = (target ? "target=" + target + " " : "") +
+        ((players === null || players === undefined) ? "" : "players=" + players + " ");
     files.append(p, [fmtTime(), csvEscape(shotPath), csvEscape(pl + note)].join(",") + "\n");
     warn("找到目標但無法取得座標，已寫入 unresolved.csv");
 }
@@ -1141,7 +1153,7 @@ function enterDetail(hit, label) {
     var tx = Math.round(hit.x + ox), ty = Math.round(hit.y + oy);
 
     for (var attempt = 0; attempt <= (pc.enabled ? pc.retries : 0); attempt++) {
-        info(label + " 點擊目標 (" + tx + "," + ty + ") 相似度 " + hit.sim.toFixed(3));
+        info(label + " 點擊目標「" + targetName(hit) + "」(" + tx + "," + ty + ") 相似度 " + hit.sim.toFixed(3));
         click(tx, ty);
 
         if (pc.enabled) {
@@ -1278,9 +1290,9 @@ function handleTarget(hit, cellShotPath, label, players) {
 
         // ---- 9. 寫紀錄 ----
         if (coords) {
-            recordCoords(coords, cellShotPath, players);
+            recordCoords(coords, cellShotPath, players, targetName(hit));
         } else {
-            recordUnresolved(cellShotPath, ocrNotes.join(" || ").replace(/\s+/g, " ").substr(0, 500), players);
+            recordUnresolved(cellShotPath, ocrNotes.join(" || ").replace(/\s+/g, " ").substr(0, 500), players, targetName(hit));
         }
         return coords;
     } finally {
@@ -1333,10 +1345,10 @@ function scanCell(index, total) {
         for (var k = 0; k < hits.length; k++) {
             var h = hits[k];
             var est = CONFIG.fastSkip.enabled ? estimateGeo(h.x, h.y) : null;
-            var rec = est ? findDuplicate(est, Date.now(), CONFIG.fastSkip.radiusMeters) : null;
+            var rec = est ? findDuplicate(est, Date.now(), CONFIG.fastSkip.radiusMeters, targetName(h)) : null;
             if (rec) {
                 var pl = readPlayerCount(img, h);
-                var old = touchRecord(rec, pl);
+                var old = touchRecord(rec, pl, targetName(h));
                 info("快速略過：推定為已記錄的 " + rec.row[1] + "," + rec.row[2] +
                     "（距推算 " + Math.round(haversine(rec, est)) + " m），人數 " +
                     (old === "" ? "?" : old) + " → " + (pl === null ? "讀不到" : pl));
