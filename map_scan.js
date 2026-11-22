@@ -76,9 +76,9 @@ var CONFIG = {
         templates: [],
         // matchTemplate 相似度門檻（0~1）。漏抓就調低（0.7），誤判就調高（0.85）
         threshold: 0.75,
-        // 比對範圍 [x, y, w, h]：排除狀態列(上 ~130px)與底部按鈕列(下 ~2200px 起)
+        // 比對範圍 [x, y, w, h]：排除上方 console 視窗(到 ~340px)與底部按鈕列(~2200px 起)
         // 依你 1080x2460 的截圖量測，畫面改版再調
-        region: [0, 140, 1080, 2060],
+        region: [0, 350, 1080, 1850],
         maxPerCapture: 5,           // 單張截圖最多取幾個符合點
         clickOffset: { x: 0, y: 30 },// 點擊位置相對於樣板中心的偏移（樣板是蘑菇傘，往下點一點較穩）
         sameTargetRadius: 120,      // 同一格內，距離小於此值（px）視為同一隻，不重點
@@ -122,7 +122,7 @@ var CONFIG = {
         centerX: 540,               // 滑動中心點（地圖中央，避開右上頭像與底部按鈕）
         centerY: 1200,
         distanceX: 800,             // 每次水平滑動距離（螢幕寬 1080，約留 25% 重疊）
-        distanceY: 1500,            // 每次垂直滑動距離（可視高度約 2060，約留 25% 重疊）
+        distanceY: 1400,            // 每次垂直滑動距離（比對高度 1850，約留 25% 重疊）
         duration: 700,              // 滑動耗時 ms（越慢越不會甩出慣性）
         holdAtEnd: true,            // 結尾停住手指，抑制地圖慣性滑動
         waitAfter: 3000             // 滑動後等地圖物件刷出的時間 ms
@@ -207,6 +207,9 @@ var CONFIG = {
 
     debug: {
         showConsole: true,          // 顯示懸浮 console
+        // console 視窗位置 [x,y,w,h]：放在左上角，不擋地圖比對範圍和底部按鈕
+        // （截圖會拍到 console，點擊也會被它擋住，所以要放在 match.region 以外）
+        consoleRect: [0, 60, 860, 280],
         saveDetailShots: false,     // 額外保存詳情頁截圖
         saveMapsShots: false        // 額外保存 Google Maps 截圖
     }
@@ -375,7 +378,8 @@ function validLatLng(lat, lng) {
  *       純文字 "25.03361, 121.56500" / 度分秒 25°02'01.0"N 121°33'54.0"E
  * 回傳 {lat, lng} 或 null
  */
-function parseCoords(raw) {
+function parseCoords(raw, allowDms) {
+    if (allowDms === undefined) allowDms = true;
     if (!raw) return null;
     var s = String(raw);
     try { s = decodeURIComponent(s.replace(/\+/g, " ")); } catch (e) { /* 非合法編碼就用原字串 */ }
@@ -399,7 +403,8 @@ function parseCoords(raw) {
         }
     }
 
-    // 度分秒
+    if (!allowDms) return null;
+    // 度分秒（精度只到 0.1 秒 ≈ 3 公尺，所以排在小數格式之後）
     var dms = /(\d{1,3})\s*°\s*(\d{1,2})\s*['′’]\s*(\d{1,2}(?:\.\d+)?)\s*["″”]?\s*([NS北南])[\s,]*(\d{1,3})\s*°\s*(\d{1,2})\s*['′’]\s*(\d{1,2}(?:\.\d+)?)\s*["″”]?\s*([EW東西])/i.exec(s);
     if (dms) {
         var la = (+dms[1]) + (+dms[2]) / 60 + (+dms[3]) / 3600;
@@ -499,14 +504,21 @@ function coordsFromScreenNodes() {
     var sources = [];
     try { sources.push(textMatches(re).find()); } catch (e) { }
     try { sources.push(descMatches(re).find()); } catch (e) { }
+    var texts = [];
     for (var s = 0; s < sources.length; s++) {
         var col = sources[s];
         if (!col) continue;
         for (var i = 0; i < col.size(); i++) {
             var n = col.get(i);
-            var t = (n.text() || "") + " " + (n.desc() || "");
-            var c = parseCoords(t);
-            if (c) { info("從畫面節點文字取得座標：" + t.trim()); return c; }
+            texts.push(((n.text() || "") + " " + (n.desc() || "")).trim());
+        }
+    }
+    // 先找小數格式（22.5066710, 120.3865560，最精確），找不到才接受度分秒
+    var passes = [false, true];
+    for (var p = 0; p < passes.length; p++) {
+        for (var k = 0; k < texts.length; k++) {
+            var c = parseCoords(texts[k], passes[p]);
+            if (c) { info("從畫面節點文字取得座標：" + texts[k]); return c; }
         }
     }
     return null;
@@ -1042,7 +1054,17 @@ function scanCell(index, total) {
 // =                              主流程                                       =
 // ============================================================================
 function setup() {
-    if (CONFIG.debug.showConsole) { try { console.show(); } catch (e) { } }
+    if (CONFIG.debug.showConsole) {
+        try {
+            console.show();
+            sleep(300);
+            var cr = CONFIG.debug.consoleRect;
+            var dm = context.getResources().getDisplayMetrics();
+            var fx = dm.widthPixels / CONFIG.screen.designWidth, fy = dm.heightPixels / CONFIG.screen.designHeight;
+            console.setSize(Math.round(cr[2] * fx), Math.round(cr[3] * fy));
+            console.setPosition(Math.round(cr[0] * fx), Math.round(cr[1] * fy));
+        } catch (e) { }
+    }
 
     auto.waitFor();   // 等無障礙服務
     [CONFIG.paths.baseDir, CONFIG.paths.shotsDir].forEach(function (d) { files.ensureDir(d); });
