@@ -110,7 +110,7 @@ var CONFIG = {
     grid: {
         cols: 5,
         rows: 5,
-        resume: true,               // 有 progress.json 時從斷點續跑
+        resume: true,               // 有 progress.json 時，啟動會跳視窗問你要不要接續
         // 若遊戲每次從 Google Maps 返回都會「自動回到玩家位置」，設 true：
         // 回來後會快速重播滑動，回到目前這一格
         recenterOnReturn: false,
@@ -194,7 +194,9 @@ var CONFIG = {
     // ---------------- 重試 ----------------
     retry: {
         perCell: 2,                 // 單格整體失敗重試次數
-        perAction: 3                // 單一動作（截圖/點擊等）重試次數
+        perAction: 3,               // 單一動作（截圖/點擊等）重試次數
+        // 連續幾格都失敗就自動停止（多半是遊戲重開、地圖跳回玩家位置，繼續跑只是浪費時間）
+        maxConsecutiveFailedCells: 3
     },
 
     // ---------------- 去重 ----------------
@@ -809,10 +811,11 @@ function loadProgress() {
     } catch (e) { logError("loadProgress", e); return null; }
 }
 
-function saveProgress(nextIndex) {
+/** nextIndex = 下一格要掃的編號；mapAt = 地圖目前停在第幾格 */
+function saveProgress(nextIndex, mapAt) {
     try {
         files.write(CONFIG.paths.progressFile, JSON.stringify({
-            nextIndex: nextIndex, cols: CONFIG.grid.cols, rows: CONFIG.grid.rows, updated: fmtTime()
+            nextIndex: nextIndex, mapAt: mapAt, cols: CONFIG.grid.cols, rows: CONFIG.grid.rows, updated: fmtTime()
         }));
     } catch (e) { logError("saveProgress", e); }
 }
@@ -1067,6 +1070,8 @@ function setup() {
     }
 
     auto.waitFor();   // 等無障礙服務
+    // 長時間掃描：保持螢幕常亮（腳本結束後自動恢復）
+    try { device.keepScreenOn(24 * 3600 * 1000); } catch (e) { warn("無法保持螢幕常亮：" + e); }
     [CONFIG.paths.baseDir, CONFIG.paths.shotsDir].forEach(function (d) { files.ensureDir(d); });
     files.ensureDir(CONFIG.paths.logCsv);
 
@@ -1091,39 +1096,68 @@ function setup() {
     loadExistingRecords();
 }
 
+/**
+ * 決定從哪一格開始、地圖目前停在哪一格。
+ * 回傳 {start, mapAt}；mapAt = start - 1 表示迴圈第一步要先滑一次
+ */
+function decideStart(total) {
+    var fresh = { start: 0, mapAt: 0 };
+    if (!CONFIG.grid.resume) return fresh;
+    var prog = loadProgress();
+    if (!prog || !(prog.nextIndex > 0) || prog.nextIndex >= total) return fresh;
+
+    var mapAt = (prog.mapAt === undefined) ? prog.nextIndex - 1 : prog.mapAt;
+    var choice = dialogs.select(
+        "上次掃到第 " + prog.nextIndex + "/" + total + " 格（" + prog.updated + "），要怎麼做？",
+        [
+            "接續：地圖還停在上次的位置（停止後沒動過地圖）",
+            "接續：地圖已回到當初的起點，自動快轉過去",
+            "從頭開始（新區域）"
+        ]);
+    if (choice === 0) {
+        info("接續：從第 " + (prog.nextIndex + 1) + " 格開始，地圖停在第 " + (mapAt + 1) + " 格");
+        return { start: prog.nextIndex, mapAt: mapAt };
+    }
+    if (choice === 1) {
+        info("接續：從起點快轉到第 " + prog.nextIndex + " 格");
+        return { start: prog.nextIndex, mapAt: -1 };   // -1 = 需要快轉
+    }
+    files.remove(CONFIG.paths.progressFile);
+    info("從頭開始：以目前地圖畫面為左上角（第 1 格）");
+    return fresh;
+}
+
 function mainLoop() {
     setup();
 
     var total = CONFIG.grid.cols * CONFIG.grid.rows;
-    var start = 0;
-    if (CONFIG.grid.resume) {
-        var prog = loadProgress();
-        if (prog && prog.nextIndex > 0 && prog.nextIndex < total) {
-            start = prog.nextIndex;
-            info("偵測到續跑進度：從第 " + (start + 1) + " 格開始（上次 " + prog.updated + "）");
-        }
-    }
+    var plan = decideStart(total);
+    var start = plan.start;
 
-    // 確認在遊戲地圖畫面（地圖應位於起點，例如以玩家為中心）
+    // 確認在遊戲地圖畫面。注意：腳本「不會」自己移動到起點，
+    // 會以你開始時看到的畫面當作網格左上角（第 1 格）
     app.launch(CONFIG.gamePackage);
     waitForPackage([CONFIG.gamePackage], 15000);
     nap(CONFIG.timing.afterLaunchGame);
     ensureOnMap();
 
-    if (start > 0) fastForwardTo(start - 1);   // 先快轉到上一格，下面迴圈會再滑一次到 start
+    var mapAt = plan.mapAt;
+    if (mapAt === -1) { fastForwardTo(start - 1); mapAt = start - 1; }
+    info("網格 " + CONFIG.grid.cols + "x" + CONFIG.grid.rows + "，共 " + total + " 格，從第 " + (start + 1) + " 格開始");
 
-    var found = 0;
+    var found = 0, failStreak = 0;
     for (var i = start; i < total; i++) {
         if (STOP.get()) break;
         var cell = cellOf(i);
+        var ok = false;
         try {
-            if (i > 0) {
+            if (mapAt < i) {
                 var dir = moveBefore(i);
                 info("→ 滑動 " + dir + "，前往格 " + (i + 1) + "/" + total + " [r" + cell.row + "c" + cell.col + "]");
                 withRetry("滑動", CONFIG.retry.perAction, function () { panView(dir); });
+                mapAt = i;
                 nap(CONFIG.swipe.waitAfter);
             }
-            var ok = false;
             for (var t = 0; t <= CONFIG.retry.perCell && !ok; t++) {
                 try {
                     found += scanCell(i, total);
@@ -1136,15 +1170,24 @@ function mainLoop() {
             }
             if (!ok) warn("格 " + (i + 1) + " 失敗，跳過");
         } catch (e) {
-            if (String(e).indexOf("STOP_REQUESTED") >= 0) { saveProgress(i); throw e; }
+            if (String(e).indexOf("STOP_REQUESTED") >= 0) { saveProgress(i, mapAt); throw e; }
             logError("格 " + (i + 1), e);   // 單格失敗不中斷整體
         }
-        saveProgress(i + 1);
+        saveProgress(i + 1, mapAt);
+
+        failStreak = ok ? 0 : failStreak + 1;
+        if (failStreak >= CONFIG.retry.maxConsecutiveFailedCells) {
+            var msg = "連續 " + failStreak + " 格失敗，自動停止（進度已保存在第 " + (i + 2) + " 格）";
+            logError("mainLoop", msg);
+            try { device.vibrate(1500); toast(msg); } catch (e) { }
+            return;
+        }
     }
 
     if (!STOP.get()) {
         files.remove(CONFIG.paths.progressFile);
         info("===== 掃描完成，本次處理目標 " + found + " 隻 =====");
+        try { device.vibrate(800); } catch (e) { }
     }
 }
 
@@ -1158,6 +1201,7 @@ var worker = threads.start(function () {
     } finally {
         TEMPLATES.forEach(function (t) { try { t.img.recycle(); } catch (e) { } });
         if (ANCHOR_IMG) { try { ANCHOR_IMG.recycle(); } catch (e) { } }
+        try { device.cancelKeepingAwake(); } catch (e) { }
     }
 });
 
