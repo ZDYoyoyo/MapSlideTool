@@ -111,6 +111,12 @@ var CONFIG = {
     // 在地圖截圖上，以「目標樣板中心」為基準，往右上方框出數字所在區域做 OCR
     players: {
         enabled: true,
+        // 記錄哪些目標："ask"＝每次開始時詢問；"all"＝全部；"emptyOnly"＝只記錄沒人（0 人）的
+        recordMode: "ask",
+        // 人頭圖案樣板：找不到人頭標籤 = 0 人（沒人參加時遊戲不顯示人數標籤）
+        iconTemplate: "/sdcard/MapScan/templates/players_icon.png",
+        iconThreshold: 0.8,
+        iconSearch: [-50, -130, 150, 110],  // 在目標中心附近 [dx,dy,w,h] 找人頭圖案
         // [dx, dy, w, h]：相對於樣板中心的偏移與大小（依你 5 張截圖量測，人頭在蘑菇傘右上方）
         region: [36, -98, 88, 52],
         scale: 3,                   // 放大幾倍再辨識（數字很小，放大較準）
@@ -275,6 +281,8 @@ var REAL_W = 0, REAL_H = 0;       // 實際截圖解析度
 var TEMPLATES = [];               // [{path, img}]
 var ANCHOR_IMG = null;
 var POPUP_IMG = null;
+var PLAYER_ICON = null;
+var EMPTY_ONLY = false;           // true = 只記錄沒人的目標
 var GEO_REF = null;               // 推算用基準點 {lat, lng, px, py, swipes}：(px,py) 是該經緯度目前在螢幕上的位置
 var RECORDS = [];                 // found.csv 全部紀錄 [{t(上次看到 ms), lat, lng, row[欄位]}]
 
@@ -670,6 +678,13 @@ function loadTemplates() {
         TEMPLATES.push({ path: p, img: img });
         info("載入樣板 " + p + "（" + img.getWidth() + "x" + img.getHeight() + "）");
     });
+    var ip = CONFIG.players.iconTemplate;
+    if (ip && files.exists(ip)) {
+        PLAYER_ICON = images.read(ip);
+        info("載入人頭圖案樣板 " + ip);
+    } else if (ip) {
+        warn("找不到人頭圖案樣板 " + ip + "，無法判斷 0 人");
+    }
     if (CONFIG.popup.enabled && CONFIG.popup.template) {
         if (files.exists(CONFIG.popup.template)) {
             POPUP_IMG = images.read(CONFIG.popup.template);
@@ -1069,6 +1084,17 @@ function readPlayerCount(img, hit) {
     var w = sx(pc.region[2]), h = sy(pc.region[3]);
     // 人數標籤若落在 console 視窗底下，讀到的會是 log 文字，直接放棄
     if (CONFIG.debug.showConsole && y < sy(CONFIG.match.region[1]) - 10) return null;
+
+    // 先看有沒有人頭圖案：沒有 = 沒人參加（0 人）
+    if (PLAYER_ICON) {
+        var sr = pc.iconSearch;
+        var ix = Math.max(0, Math.round(hit.x + sx(sr[0]))), iy = Math.max(0, Math.round(hit.y + sy(sr[1])));
+        var iw = Math.min(sx(sr[2]), REAL_W - ix), ih = Math.min(sy(sr[3]), REAL_H - iy);
+        if (iw > PLAYER_ICON.getWidth() && ih > PLAYER_ICON.getHeight()) {
+            var icon = images.findImage(img, PLAYER_ICON, { threshold: pc.iconThreshold, region: [ix, iy, iw, ih] });
+            if (!icon) return 0;
+        }
+    }
     x = Math.max(0, x); y = Math.max(0, y);
     w = Math.min(w, REAL_W - x); h = Math.min(h, REAL_H - y);
     if (w <= 4 || h <= 4) return null;
@@ -1302,8 +1328,8 @@ function scanCell(index, total) {
         if (round === 0) info("格 " + (index + 1) + "/" + total + " [" + label + "] 比對到 " + hits.length + " 個目標");
         if (!hits.length) break;
 
-        // ---- 先把「推算為已記錄」的目標快速處理掉（不點擊、地圖不會動）----
-        var unknown = null;
+        // ---- 先把「推算為已記錄」與「有人（只記錄沒人模式）」的目標快速處理掉（不點擊、地圖不會動）----
+        var unknown = null, unknownPlayers = null;
         for (var k = 0; k < hits.length; k++) {
             var h = hits[k];
             var est = CONFIG.fastSkip.enabled ? estimateGeo(h.x, h.y) : null;
@@ -1317,7 +1343,14 @@ function scanCell(index, total) {
                 handled.push(h);
                 quick++;
             } else if (!unknown) {
-                unknown = h;
+                var hp = readPlayerCount(img, h);
+                if (EMPTY_ONLY && hp !== 0) {
+                    info("有人參加（" + (hp === null ? "人數讀不到" : hp + " 人") + "），只記錄沒人的 → 略過");
+                    handled.push(h);
+                } else {
+                    unknown = h;
+                    unknownPlayers = hp;
+                }
             }
         }
         if (!unknown || clicks >= CONFIG.match.maxTargetsPerCell) break;
@@ -1326,7 +1359,7 @@ function scanCell(index, total) {
         var hit = unknown;
         handled.push(hit);
         var shotPath = saveShot(img, "target_" + fmtFileTime() + "_" + label + "_" + clicks);
-        var players = readPlayerCount(img, hit);   // 點擊前先讀人數（點下去後地圖會移動）
+        var players = unknownPlayers;   // 點擊前已讀好人數（點下去後地圖會移動）
         info("參加人數：" + (players === null ? "讀不到" : players));
         var coords = null;
         try {
@@ -1500,6 +1533,16 @@ function mainLoop() {
     }
     if (!(g.cols > 0 && g.rows > 0)) throw new Error("請設定 grid.sizeKm，或 grid.cols / grid.rows（正整數）");
     var total = g.cols * g.rows;
+
+    var mode = CONFIG.players.recordMode;
+    if (mode === "ask") {
+        var mc = dialogs.select("要記錄哪些菇？", ["全部記錄", "只記錄沒人的菇（0 人）"]);
+        mode = (mc === 1) ? "emptyOnly" : "all";
+    }
+    EMPTY_ONLY = (mode === "emptyOnly");
+    if (EMPTY_ONLY && !PLAYER_ICON) throw new Error("「只記錄沒人的」需要人頭圖案樣板 " + CONFIG.players.iconTemplate + "，請先執行 install");
+    info("記錄模式：" + (EMPTY_ONLY ? "只記錄沒人的菇" : "全部記錄"));
+
     var plan = decideStart(total);
     var start = plan.start;
 
